@@ -3,7 +3,11 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { describe, it } from "node:test";
-import { formatAsyncRunList, listAsyncRuns } from "../../src/runs/background/async-status.ts";
+import {
+	formatAsyncRunList,
+	listAsyncRuns,
+	listCachedAsyncRuns,
+} from "../../src/runs/background/async-status.ts";
 
 function createAsyncDir(root: string, id: string, status: Record<string, unknown>): string {
 	const dir = path.join(root, id);
@@ -13,6 +17,53 @@ function createAsyncDir(root: string, id: string, status: Record<string, unknown
 }
 
 describe("async status helpers", () => {
+	it("refreshes cached summaries after same-size/same-mtime replacement and root recreation", () => {
+		const root = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-async-status-cache-"),
+		);
+		const statusPath = path.join(root, "run", "status.json");
+		const write = (runId: string) => {
+			fs.mkdirSync(path.dirname(statusPath), { recursive: true });
+			fs.writeFileSync(
+				statusPath,
+				JSON.stringify({
+					runId,
+					mode: "single",
+					state: "running",
+					startedAt: 1,
+					steps: [],
+				}),
+				"utf8",
+			);
+		};
+		try {
+			write("run-a");
+			assert.equal(listCachedAsyncRuns(root)[0]?.id, "run-a");
+			const original = fs.statSync(statusPath);
+			const replacement = `${statusPath}.next`;
+			fs.writeFileSync(
+				replacement,
+				JSON.stringify({
+					runId: "run-b",
+					mode: "single",
+					state: "running",
+					startedAt: 1,
+					steps: [],
+				}),
+				"utf8",
+			);
+			fs.utimesSync(replacement, original.atime, original.mtime);
+			assert.equal(fs.statSync(replacement).size, original.size);
+			fs.renameSync(replacement, statusPath);
+			assert.equal(listCachedAsyncRuns(root)[0]?.id, "run-b");
+			fs.rmSync(root, { recursive: true, force: true });
+			write("run-c");
+			assert.equal(listCachedAsyncRuns(root)[0]?.id, "run-c");
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
 	it("lists only requested states and includes flattened step summaries", () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-async-status-"));
 		try {
@@ -28,7 +79,13 @@ describe("async status helpers", () => {
 				outputFile,
 				steps: [
 					{ agent: "scout", status: "complete", durationMs: 10 },
-					{ agent: "worker", status: "running", durationMs: 20 },
+					{
+						agent: "worker",
+						status: "running",
+						durationMs: 20,
+						task: "Caller-facing task",
+						sessionFile: "/tmp/worker/session.jsonl",
+					},
 				],
 			});
 			createAsyncDir(root, "run-b", {
@@ -47,6 +104,11 @@ describe("async status helpers", () => {
 			assert.equal(runs[0]?.steps.length, 2);
 			assert.equal(runs[0]?.steps[1]?.agent, "worker");
 			assert.equal(runs[0]?.steps[1]?.status, "running");
+			assert.equal(runs[0]?.steps[1]?.task, "Caller-facing task");
+			assert.equal(
+				runs[0]?.steps[1]?.sessionFile,
+				"/tmp/worker/session.jsonl",
+			);
 			assert.match(formatAsyncRunList(runs), /output: .*output-1\.log/);
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });

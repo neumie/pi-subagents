@@ -874,6 +874,8 @@ export interface AsyncStatus {
 		context?: "fresh" | "fork";
 		phase?: string;
 		label?: string;
+		/** Bounded caller-task preview for read-only status viewers. */
+		task?: string;
 		outputName?: string;
 		structured?: boolean;
 		status: "pending" | "running" | "complete" | "completed" | "failed" | "paused" | "stopped";

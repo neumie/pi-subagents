@@ -26,6 +26,7 @@ import type { SlashSubagentResponse, SlashSubagentUpdate } from "./slash-bridge.
 import { registerPromptWorkflowCommands } from "./prompt-workflows.ts";
 import { openSubagentsAdmin } from "./subagents-admin.ts";
 import { openSubagentFleet } from "../tui/fleet.ts";
+import { openSubagentWatch } from "../tui/subagent-watch.ts";
 import {
 	applySlashUpdate,
 	buildSlashInitialResult,
@@ -1155,6 +1156,29 @@ export function registerSlashCommands(
 			fleetOpen = false;
 		}
 	};
+	let watchOpen = false;
+	const showWatch = async (ctx: ExtensionContext) => {
+		state.lastUiContext = ctx;
+		if (watchOpen) {
+			ctx.ui.notify("Subagent watch is already open.", "info");
+			return;
+		}
+		const sessionId =
+			state.currentSessionId ?? ctx.sessionManager.getSessionId();
+		if (!sessionId) {
+			ctx.ui.notify(
+				"Current Pi session has no id; subagent runs cannot be matched safely.",
+				"warning",
+			);
+			return;
+		}
+		watchOpen = true;
+		try {
+			await openSubagentWatch(ctx, { asyncDirRoot: ASYNC_DIR, sessionId });
+		} finally {
+			watchOpen = false;
+		}
+	};
 
 	pi.registerCommand("subagents", {
 		description: "Administer subagents: inspect metadata and update models, thinking, or prompts",
@@ -1278,6 +1302,11 @@ export function registerSlashCommands(
 	pi.registerCommand("subagents-fleet", {
 		description: "Open the live, inspection-only subagent fleet",
 		handler: async (_args, ctx) => showFleet(ctx),
+	});
+
+	pi.registerCommand("subagents-watch", {
+		description: "Switch to a live read-only view of current-session async subagents",
+		handler: async (_args, ctx) => showWatch(ctx),
 	});
 
 	pi.registerShortcut(Key.ctrlAlt("f"), {

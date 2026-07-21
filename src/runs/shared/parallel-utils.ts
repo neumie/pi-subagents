@@ -2,7 +2,10 @@ export interface RunnerSubagentStep {
 	/** Session id of the direct parent session for permission-system ask forwarding. */
 	parentSessionId?: string;
 	agent: string;
+	/** Expanded execution payload; never expose through status. */
 	task: string;
+	/** Raw caller-facing task/template retained only as bounded status metadata. */
+	callerTask?: string;
 	/** Resolved launch context for this child. */
 	context?: "fresh" | "fork";
 	importAsyncRoot?: {

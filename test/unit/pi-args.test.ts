@@ -43,6 +43,9 @@ const originalEnv = {
 	PI_SUBAGENT_PARENT_SESSION: process.env.PI_SUBAGENT_PARENT_SESSION,
 	PI_SUBAGENT_RUN_ID: process.env.PI_SUBAGENT_RUN_ID,
 	[PI_CODING_AGENT_PACKAGE_ROOT_ENV]: process.env[PI_CODING_AGENT_PACKAGE_ROOT_ENV],
+	PI_LENS_STARTUP_MODE: process.env.PI_LENS_STARTUP_MODE,
+	PI_LENS_COLD_START_QUICK: process.env.PI_LENS_COLD_START_QUICK,
+	PI_LENS_SUBAGENT_FULL: process.env.PI_LENS_SUBAGENT_FULL,
 };
 const originalCwd = process.cwd();
 const tempRoots: string[] = [];
@@ -121,6 +124,59 @@ afterEach(() => {
 	for (const root of tempRoots.splice(0)) {
 		fs.rmSync(root, { recursive: true, force: true });
 	}
+});
+
+describe("Pi Lens child startup defaults", () => {
+	it("keeps child startup quick without scheduling a warmup by default", () => {
+		delete process.env.PI_LENS_STARTUP_MODE;
+		delete process.env.PI_LENS_COLD_START_QUICK;
+		delete process.env.PI_LENS_SUBAGENT_FULL;
+
+		const { env } = buildPiArgs({
+			baseArgs: ["-p"],
+			task: "hello",
+			sessionEnabled: false,
+			inheritProjectContext: false,
+			inheritSkills: false,
+		});
+
+		assert.equal(env.PI_LENS_STARTUP_MODE, "quick");
+		assert.equal(env.PI_LENS_COLD_START_QUICK, "0");
+	});
+
+	it("preserves every explicit child startup override", () => {
+		const explicitOverrides = [
+			["PI_LENS_STARTUP_MODE", "full"],
+			["PI_LENS_COLD_START_QUICK", "1"],
+			["PI_LENS_SUBAGENT_FULL", "1"],
+		] as const;
+
+		for (const [key, value] of explicitOverrides) {
+			delete process.env.PI_LENS_STARTUP_MODE;
+			delete process.env.PI_LENS_COLD_START_QUICK;
+			delete process.env.PI_LENS_SUBAGENT_FULL;
+			process.env[key] = value;
+
+			const { env } = buildPiArgs({
+				baseArgs: ["-p"],
+				task: "hello",
+				sessionEnabled: false,
+				inheritProjectContext: false,
+				inheritSkills: false,
+			});
+
+			assert.equal(
+				env.PI_LENS_STARTUP_MODE,
+				undefined,
+				`${key} should suppress the default startup mode`,
+			);
+			assert.equal(
+				env.PI_LENS_COLD_START_QUICK,
+				undefined,
+				`${key} should suppress the default cold-start policy`,
+			);
+		}
+	});
 });
 
 describe("buildPiArgs session wiring", () => {

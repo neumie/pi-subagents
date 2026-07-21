@@ -7,6 +7,7 @@ import type { AsyncParallelGroupStatus, AsyncStatus, WorkflowGraphNode, Workflow
 import { readStatus } from "../../shared/utils.ts";
 import type { DynamicRunnerGroup, ParallelStepGroup, RunnerStep, RunnerSubagentStep } from "../shared/parallel-utils.ts";
 import { isDynamicRunnerGroup, isParallelGroup } from "../shared/parallel-utils.ts";
+import { toAsyncTaskPreview } from "./async-task-preview.ts";
 
 const APPEND_REQUESTS_DIR = "append-requests";
 
@@ -134,6 +135,7 @@ function statusStepForTask(task: RunnerSubagentStep): StatusStep {
 		...(task.context ? { context: task.context } : {}),
 		phase: task.phase,
 		label: task.label,
+		...(task.callerTask !== undefined ? { task: toAsyncTaskPreview(task.callerTask) } : {}),
 		outputName: task.outputName,
 		structured: task.structured,
 		status: "pending",
@@ -155,6 +157,7 @@ function statusStepsForRunnerStep(step: RunnerStep): StatusStep[] {
 			...(step.parallel.context ? { context: step.parallel.context } : {}),
 			phase: step.phase ?? step.parallel.phase,
 			label: step.label ?? step.parallel.label ?? `Dynamic fanout (${step.collect.as})`,
+			...(step.parallel.callerTask !== undefined ? { task: toAsyncTaskPreview(step.parallel.callerTask) } : {}),
 			outputName: step.collect.as,
 			structured: Boolean(step.collect.outputSchema),
 			status: "pending",

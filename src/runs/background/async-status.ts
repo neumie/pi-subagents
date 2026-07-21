@@ -16,8 +16,11 @@ interface AsyncRunStepSummary {
 	context?: ContextMode;
 	label?: string;
 	phase?: string;
+	/** Raw caller-facing task/template retained by status creation. */
+	task?: string;
 	outputName?: string;
 	structured?: boolean;
+	sessionFile?: string;
 	status: AsyncJobStep["status"];
 	activityState?: ActivityState;
 	lastActivityAt?: number;
@@ -169,8 +172,10 @@ function statusToSummary(asyncDir: string, status: AsyncStatus & { cwd?: string 
 			...(step.context ? { context: step.context } : {}),
 			...(step.label ? { label: step.label } : {}),
 			...(step.phase ? { phase: step.phase } : {}),
+			...(step.task !== undefined ? { task: step.task } : {}),
 			...(step.outputName ? { outputName: step.outputName } : {}),
 			...(step.structured ? { structured: step.structured } : {}),
+			...(step.sessionFile ? { sessionFile: step.sessionFile } : {}),
 			status: step.status,
 			...(stepActivityState ? { activityState: stepActivityState } : {}),
 			...(stepLastActivityAt ? { lastActivityAt: stepLastActivityAt } : {}),
@@ -318,6 +323,160 @@ export function listAsyncRuns(asyncDirRoot: string, options: AsyncRunListOptions
 
 	const sorted = sortRuns(runs);
 	return options.limit !== undefined ? sorted.slice(0, options.limit) : sorted;
+}
+
+interface FileIdentity {
+	dev: number;
+	ino: number;
+	ctimeMs: number;
+	mtimeMs: number;
+	size: number;
+}
+
+interface CachedAsyncRun {
+	identity: FileIdentity;
+	summary: AsyncRunSummary;
+}
+
+interface CachedAsyncRoot {
+	identity: FileIdentity;
+	runs: Map<string, CachedAsyncRun>;
+}
+
+const cachedAsyncRunsByRoot = new Map<string, CachedAsyncRoot>();
+
+function fileIdentity(stat: fs.Stats): FileIdentity {
+	return {
+		dev: stat.dev,
+		ino: stat.ino,
+		ctimeMs: stat.ctimeMs,
+		mtimeMs: stat.mtimeMs,
+		size: stat.size,
+	};
+}
+
+function sameFileIdentity(left: FileIdentity, right: FileIdentity): boolean {
+	return (
+		left.dev === right.dev &&
+		left.ino === right.ino &&
+		left.ctimeMs === right.ctimeMs &&
+		left.mtimeMs === right.mtimeMs &&
+		left.size === right.size
+	);
+}
+
+function readStableStatus(
+	statusPath: string,
+):
+	| { identity: FileIdentity; status: AsyncStatus & { cwd?: string } }
+	| undefined {
+	for (let attempt = 0; attempt < 2; attempt++) {
+		let before: fs.Stats;
+		let raw: string;
+		try {
+			before = fs.statSync(statusPath);
+			raw = fs.readFileSync(statusPath, "utf8");
+		} catch (error) {
+			if (isNotFoundError(error)) return undefined;
+			throw error;
+		}
+		let after: fs.Stats;
+		try {
+			after = fs.statSync(statusPath);
+		} catch (error) {
+			if (isNotFoundError(error)) continue;
+			throw error;
+		}
+		const identity = fileIdentity(after);
+		if (!sameFileIdentity(fileIdentity(before), identity)) continue;
+		try {
+			return {
+				identity,
+				status: JSON.parse(raw) as AsyncStatus & { cwd?: string },
+			};
+		} catch {
+			return undefined;
+		}
+	}
+	return undefined;
+}
+
+/**
+ * Read-only status listing for recurring TUI refreshes. It scans run
+ * directories once per call but only reparses status.json when a
+ * replacement-sensitive identity changes. Returned summaries are immutable.
+ */
+export function listCachedAsyncRuns(
+	asyncDirRoot: string,
+	options: Pick<AsyncRunListOptions, "states" | "sessionId" | "limit"> = {},
+): AsyncRunSummary[] {
+	const root = path.resolve(asyncDirRoot);
+	let rootStat: fs.Stats;
+	let entries: string[];
+	try {
+		rootStat = fs.statSync(asyncDirRoot);
+		entries = fs
+			.readdirSync(asyncDirRoot)
+			.filter((entry) => isAsyncRunDir(asyncDirRoot, entry));
+	} catch (error) {
+		if (isNotFoundError(error)) {
+			cachedAsyncRunsByRoot.delete(root);
+			return [];
+		}
+		throw new Error(
+			`Failed to list async runs in '${asyncDirRoot}': ${getErrorMessage(error)}`,
+			{ cause: error instanceof Error ? error : undefined },
+		);
+	}
+	const rootIdentity = fileIdentity(rootStat);
+	let cachedRoot = cachedAsyncRunsByRoot.get(root);
+	if (!cachedRoot || !sameFileIdentity(cachedRoot.identity, rootIdentity)) {
+		cachedRoot = { identity: rootIdentity, runs: new Map() };
+		cachedAsyncRunsByRoot.set(root, cachedRoot);
+	}
+	const present = new Set(entries);
+	for (const entry of entries) {
+		const asyncDir = path.join(asyncDirRoot, entry);
+		const statusPath = path.join(asyncDir, "status.json");
+		let observed: fs.Stats;
+		try {
+			observed = fs.statSync(statusPath);
+		} catch (error) {
+			if (isNotFoundError(error)) {
+				cachedRoot.runs.delete(entry);
+				continue;
+			}
+			throw new Error(
+				`Failed to inspect async status '${statusPath}': ${getErrorMessage(error)}`,
+				{ cause: error instanceof Error ? error : undefined },
+			);
+		}
+		const identity = fileIdentity(observed);
+		const cached = cachedRoot.runs.get(entry);
+		if (cached && sameFileIdentity(cached.identity, identity)) continue;
+		const stable = readStableStatus(statusPath);
+		if (!stable) {
+			cachedRoot.runs.delete(entry);
+			continue;
+		}
+		cachedRoot.runs.set(entry, {
+			identity: stable.identity,
+			summary: statusToSummary(asyncDir, stable.status),
+		});
+	}
+	for (const entry of cachedRoot.runs.keys()) {
+		if (!present.has(entry)) cachedRoot.runs.delete(entry);
+	}
+	const allowedStates = options.states ? new Set(options.states) : undefined;
+	const runs = [...cachedRoot.runs.values()]
+		.map((entry) => entry.summary)
+		.filter(
+			(run) =>
+				(!allowedStates || allowedStates.has(run.state)) &&
+				(!options.sessionId || run.sessionId === options.sessionId),
+		);
+	const sorted = sortRuns(runs);
+	return options.limit === undefined ? sorted : sorted.slice(0, options.limit);
 }
 
 function formatActivityFacts(input: { activityState?: ActivityState; lastActivityAt?: number; currentTool?: string; currentToolStartedAt?: number; currentPath?: string; turnCount?: number; toolCount?: number; steering?: SteeringStatus; turnBudget?: TurnBudgetState; turnBudgetExceeded?: boolean; wrapUpRequested?: boolean }): string | undefined {

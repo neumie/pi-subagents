@@ -3,9 +3,11 @@
 ## [Unreleased]
 
 ### Added
+- Added `/subagents-watch`, a read-only current-session async child watcher with bounded task previews and sanitized transcript tails.
 - Show each subagent child’s resolved `[fresh]` or `[fork]` launch context in foreground results, async status, fleet, and widget surfaces, with `[mixed]` on aggregate headers when a run uses both modes.
 
 ### Fixed
+- Default Pi Lens child startup to quick mode without delayed warmup while preserving explicit Lens environment overrides.
 - Registered the native child `intercom` fallback before strict tool-allowlist diagnostics run and stopped treating Pi core tools as missing extension tools, preventing read-only scouts and workers from failing before execution when strict child tool allowlists are active.
 - Kept async oracle review tasks with implementation vocabulary from triggering write-evidence acceptance contracts or the no-mutation implementation guard.
 - Added the missing `context: "fork"` field to the fork-context example in the bundled `pi-subagents` skill. Thanks to Kier (@kierr) for #540.

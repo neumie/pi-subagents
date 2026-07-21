@@ -817,6 +817,7 @@ function appendStepToAsyncChain(input: {
 	};
 	const built = buildAsyncRunnerSteps(resolved.id, {
 		chain: wrapChainTasksForFork(input.params.chain, contextPolicy),
+		callerChain: input.params.chain,
 		task: input.params.task,
 		resultMode: "chain",
 		agents,
@@ -1187,6 +1188,7 @@ async function resumeAsyncRun(input: {
 		const normalized = normalizeSkillInput(input.params.skill);
 		const result = executeAsyncChain(runId, {
 			chain,
+			callerChain: attachChain,
 			task: workflowTask,
 			goal,
 			attachRoot: {
@@ -2031,6 +2033,7 @@ function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): AgentTool
 		const chain = wrapChainTasksForFork(rawChain, contextPolicy);
 		return executeAsyncChain(id, {
 			chain,
+			callerChain: rawChain,
 			task: params.task,
 			goal: resolveAsyncEventGoal(params.task, rawChain),
 			agents,
@@ -2215,6 +2218,7 @@ async function runChainPath(data: ExecutionContextData, deps: ExecutorDeps): Pro
 		const firstAgent = firstChainAgent(rawAsyncChain);
 		return executeAsyncChain(id, {
 			chain: asyncChain,
+			callerChain: rawAsyncChain,
 			task: params.task,
 			goal: resolveAsyncEventGoal(params.task, rawAsyncChain, firstAgent ? shouldForkAgent(contextPolicy, firstAgent) : false),
 			agents,
@@ -3022,6 +3026,7 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 			return executeAsyncSingle(id, {
 				agent: params.agent!,
 				task: shouldForkAgent(contextPolicy, params.agent!) ? wrapForkTask(task) : task,
+				callerTask: task,
 				goal: task,
 				agentConfig,
 				ctx: asyncCtx,

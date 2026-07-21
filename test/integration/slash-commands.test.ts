@@ -2082,6 +2082,83 @@ describe("subagents-doctor slash command", { skip: !available ? "slash-commands.
 		assert.match(rendered, /inspection only/);
 	});
 
+	it("opens the interactive subagent watch view scoped to the current session", async () => {
+		const currentId = `watch-current-${Date.now().toString(36)}`;
+		const otherId = `watch-other-${Date.now().toString(36)}`;
+		const writeRun = (id: string, sessionId: string, agent: string) => {
+			const dir = path.join(ASYNC_DIR, id);
+			fs.mkdirSync(dir, { recursive: true });
+			fs.writeFileSync(
+				path.join(dir, "status.json"),
+				JSON.stringify({
+					runId: id,
+					sessionId,
+					mode: "single",
+					state: "running",
+					startedAt: Date.now(),
+					lastUpdate: Date.now(),
+					steps: [{ agent, status: "running", startedAt: Date.now() }],
+				}),
+				"utf8",
+			);
+		};
+		writeRun(currentId, "session-watch", "worker");
+		writeRun(otherId, "session-other", "scout");
+		try {
+			const commands = new Map<string, RegisteredSlashCommand>();
+			const pi = {
+				events: createEventBus(),
+				registerCommand(name: string, spec: RegisteredSlashCommand) {
+					commands.set(name, spec);
+				},
+				registerShortcut() {},
+				sendMessage(_message: unknown) {},
+			};
+			const state = createState(process.cwd());
+			state.currentSessionId = "session-watch";
+			registerSlashCommands!(pi, state);
+			let rendered = "";
+			await commands.get("subagents-watch")!.handler(
+				"",
+				createCommandContext({
+					hasUI: true,
+					custom: async (factory: unknown) => {
+						const component = (
+							factory as (
+								tui: unknown,
+								theme: unknown,
+								keybindings: unknown,
+								done: () => void,
+							) => { render(width: number): string[] }
+						)(
+							{ terminal: { rows: 30 }, requestRender() {} },
+							{
+								fg: (_color: string, text: string) => text,
+								bg: (_color: string, text: string) => text,
+								bold: (text: string) => text,
+							},
+							undefined,
+							() => {},
+						);
+						rendered = component.render(100).join("\n");
+						return undefined;
+					},
+				}),
+			);
+			assert.match(rendered, /worker/);
+			assert.doesNotMatch(rendered, /scout/);
+		} finally {
+			fs.rmSync(path.join(ASYNC_DIR, currentId), {
+				recursive: true,
+				force: true,
+			});
+			fs.rmSync(path.join(ASYNC_DIR, otherId), {
+				recursive: true,
+				force: true,
+			});
+		}
+	});
+
 	it("routes subagents-stop with an id directly to the stop action", async () => {
 		const { params } = await captureSlashCommandParams("subagents-stop", "run-123", process.cwd());
 		assert.deepEqual(params, { action: "stop", id: "run-123" });

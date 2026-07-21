@@ -2,6 +2,10 @@ import assert from "node:assert/strict";
 import * as path from "node:path";
 import { describe, it } from "node:test";
 import { buildAsyncRunnerSteps, formatAsyncStartedMessage, resolveAsyncRunnerLogPaths } from "../../src/runs/background/async-execution.ts";
+import {
+	ASYNC_TASK_PREVIEW_MAX_BYTES,
+	toAsyncTaskPreview,
+} from "../../src/runs/background/async-task-preview.ts";
 import type { AgentConfig } from "../../src/agents/agents.ts";
 
 const agent = (name: string, toolBudget?: AgentConfig["toolBudget"]): AgentConfig => ({
@@ -82,6 +86,83 @@ describe("async runner execution", () => {
 
 		assert.ok("steps" in result, "expected successful step build");
 		assert.deepEqual(result.steps[0]?.toolBudget, { hard: 4, block: ["read"] });
+	});
+
+	it("keeps raw caller metadata separate from fork execution prompts", () => {
+		const result = buildAsyncRunnerSteps("run-raw", {
+			chain: [{ agent: "worker", task: "fork preamble\n\nTask:\nRaw task" }],
+			callerChain: [{ agent: "worker", task: "Raw task" }],
+			agents: [agent("worker")],
+			ctx,
+			asyncDir: path.join(process.cwd(), ".tmp-async-test"),
+			maxSubagentDepth: 2,
+		});
+		assert.ok("steps" in result, "expected successful step build");
+		const step = result.steps[0];
+		assert.equal("parallel" in step, false);
+		assert.equal("callerTask" in step && step.callerTask, "Raw task");
+		assert.match("task" in step ? step.task : "", /fork preamble/);
+	});
+
+	it("uses {previous} when caller-chain tasks are omitted", () => {
+		const result = buildAsyncRunnerSteps("run-omitted", {
+			chain: [
+				{ agent: "worker", task: "wrapped sequential" },
+				{ parallel: [{ agent: "worker", task: "wrapped parallel" }] },
+				{
+					expand: { from: { output: "items", path: "/" }, item: "item" },
+					parallel: { agent: "worker", task: "wrapped dynamic" },
+					collect: { as: "results" },
+				},
+			],
+			callerChain: [
+				{ agent: "worker" },
+				{ parallel: [{ agent: "worker" }] },
+				{
+					expand: { from: { output: "items", path: "/" }, item: "item" },
+					parallel: { agent: "worker" },
+					collect: { as: "results" },
+				},
+			],
+			agents: [agent("worker")],
+			ctx,
+			asyncDir: path.join(process.cwd(), ".tmp-async-test"),
+			maxSubagentDepth: 2,
+			validateOutputBindings: false,
+		});
+		assert.ok("steps" in result);
+		const [sequential, parallel, dynamic] = result.steps;
+		assert.equal(
+			"callerTask" in sequential && sequential.callerTask,
+			"{previous}",
+		);
+		assert.equal(
+			"parallel" in parallel &&
+				Array.isArray(parallel.parallel) &&
+				parallel.parallel[0]?.callerTask,
+			"{previous}",
+		);
+		assert.equal(
+			"parallel" in dynamic &&
+				!Array.isArray(dynamic.parallel) &&
+				dynamic.parallel.callerTask,
+			"{previous}",
+		);
+	});
+
+	it("bounds task previews on UTF-8 code-point boundaries", () => {
+		const preview = toAsyncTaskPreview(
+			"é".repeat(ASYNC_TASK_PREVIEW_MAX_BYTES),
+		);
+		assert.ok(preview?.endsWith("… [truncated]"));
+		assert.ok(
+			Buffer.byteLength(preview ?? "", "utf8") <= ASYNC_TASK_PREVIEW_MAX_BYTES,
+		);
+		assert.equal(
+			toAsyncTaskPreview("x".repeat(ASYNC_TASK_PREVIEW_MAX_BYTES)),
+			"x".repeat(ASYNC_TASK_PREVIEW_MAX_BYTES),
+		);
+		assert.equal(toAsyncTaskPreview(undefined), undefined);
 	});
 
 	it("uses config default when no step, run, or agent budget exists", () => {

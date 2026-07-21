@@ -95,6 +95,7 @@ import { writeInitialProgressFile } from "../../shared/settings.ts";
 import { resolveSubagentIntercomTarget } from "../../intercom/intercom-bridge.ts";
 import { acceptanceFailureMessage, aggregateAcceptanceReport, buildSkippedAcceptanceLedger, evaluateAcceptance, formatAcceptancePrompt, resolveEffectiveAcceptance, stripAcceptanceReport } from "../shared/acceptance.ts";
 import { waitForImportedAsyncRoot } from "./chain-root-attachment.ts";
+import { toAsyncTaskPreview } from "./async-task-preview.ts";
 import { appendRunnerStepsToStatus, consumeChainAppendRequests, countPendingChainAppendRequests } from "./chain-append.ts";
 import { appendTurnBudgetSystemPrompt, formatTurnBudgetOutput, initialTurnBudgetState, turnBudgetDecision, turnBudgetDeferredNote, turnBudgetDeferredState, turnBudgetExceededMessage, turnBudgetSoftNote, turnBudgetState } from "../shared/turn-budget.ts";
 import { initialToolBudgetState, toolBudgetState } from "../shared/tool-budget.ts";
@@ -1617,6 +1618,7 @@ async function runSubagent(
 					...(task.context ? { context: task.context } : {}),
 					phase: task.phase,
 					label: task.label,
+					...(task.callerTask !== undefined ? { task: toAsyncTaskPreview(task.callerTask) } : {}),
 					outputName: task.outputName,
 					structured: task.structured,
 					status: "pending",
@@ -1639,6 +1641,7 @@ async function runSubagent(
 				...(step.parallel.context ? { context: step.parallel.context } : {}),
 				phase: step.phase ?? step.parallel.phase,
 				label: step.label ?? step.parallel.label ?? `Dynamic fanout (${step.collect.as})`,
+				...(step.parallel.callerTask !== undefined ? { task: toAsyncTaskPreview(step.parallel.callerTask) } : {}),
 				outputName: step.collect.as,
 				structured: Boolean(step.collect.outputSchema),
 				status: "pending",
@@ -1655,6 +1658,7 @@ async function runSubagent(
 				...(step.context ? { context: step.context } : {}),
 				phase: step.phase,
 				label: step.label,
+				...(step.callerTask !== undefined ? { task: toAsyncTaskPreview(step.callerTask) } : {}),
 				outputName: step.outputName,
 				structured: step.structured,
 				status: "pending",
@@ -2746,6 +2750,7 @@ async function runSubagent(
 					...(task.context ? { context: task.context } : {}),
 					phase: task.phase ?? step.phase,
 					label: task.label,
+					...(task.callerTask !== undefined ? { task: toAsyncTaskPreview(task.callerTask) } : {}),
 					outputName: undefined,
 					structured: Boolean(task.structuredOutputSchema),
 					status: "pending",

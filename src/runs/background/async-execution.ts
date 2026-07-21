@@ -117,7 +117,10 @@ interface AsyncExecutionContext {
 }
 
 interface AsyncChainParams {
+	/** Execution chain; may contain fork wrappers. */
 	chain: ChainStep[];
+	/** Raw caller templates for read-only status metadata. */
+	callerChain?: ChainStep[];
 	task?: string;
 	/** Raw caller-facing goal used only by the started event. */
 	goal?: string;
@@ -159,6 +162,8 @@ interface AsyncChainParams {
 interface AsyncSingleParams {
 	agent: string;
 	task?: string;
+	/** Raw caller task retained only as read-only status metadata. */
+	callerTask?: string;
 	/** Raw caller-facing goal used only by the started event. */
 	goal?: string;
 	agentConfig: AgentConfig;
@@ -205,6 +210,8 @@ interface AsyncExecutionResult {
 
 export interface AsyncRunnerStepBuildParams {
 	chain: ChainStep[];
+	/** Raw caller templates; never used as execution prompts. */
+	callerChain?: ChainStep[];
 	task?: string;
 	attachRoot?: ImportedAsyncRoot & { agent: string; outputName?: string; label?: string };
 	resultMode?: SubagentRunMode;
@@ -501,6 +508,7 @@ class AsyncStartValidationError extends Error {}
 export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildParams): AsyncRunnerStepBuildResult {
 	const {
 		chain,
+		callerChain,
 		agents,
 		ctx,
 		cwd,
@@ -567,7 +575,7 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 			...(s.model !== undefined ? { model: s.model } : {}),
 		};
 	};
-	const buildSeqStep = (s: SequentialStep, sessionFile?: string, behaviorCwd?: string, progressPrecreated = false, resolvedBehavior?: ResolvedStepBehavior, flatIndex?: number, parallelOutputNamespace?: { stepIndex: number; taskIndex?: number }) => {
+	const buildSeqStep = (s: SequentialStep, callerTask: string | undefined, sessionFile?: string, behaviorCwd?: string, progressPrecreated = false, resolvedBehavior?: ResolvedStepBehavior, flatIndex?: number, parallelOutputNamespace?: { stepIndex: number; taskIndex?: number }) => {
 		const a = agents.find((x) => x.name === s.agent)!;
 		const toolBudgetInput = s.toolBudget ?? params.toolBudget ?? a.toolBudget ?? params.configToolBudget;
 		const resolvedToolBudget = validateToolBudgetConfig(toolBudgetInput, s.toolBudget ? "toolBudget" : a.toolBudget ? "agent.toolBudget" : "config.toolBudget");
@@ -632,6 +640,7 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 			parentSessionId: ctx.parentSessionId ?? ctx.currentSessionId,
 			agent: s.agent,
 			task,
+			...(callerTask !== undefined ? { callerTask } : {}),
 			...(params.contextForAgent ? { context: params.contextForAgent(s.agent) } : {}),
 			phase: s.phase,
 			label: s.label,
@@ -691,6 +700,7 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 
 	try {
 		const builtSteps = chain.map((s, stepIndex) => {
+			const callerStep = callerChain?.[stepIndex];
 			if (isParallelStep(s)) {
 				const parallelBehaviors = s.parallel.map((task) => {
 					const agent = agents.find((candidate) => candidate.name === task.agent)!;
@@ -712,7 +722,7 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 							}
 						}
 						const staticStep = nextFlatStep();
-						return buildSeqStep(t, staticStep.sessionFile, behaviorCwd, progressPrecreated, parallelBehaviors[taskIndex], staticStep.index, { stepIndex, taskIndex });
+						return buildSeqStep(t, callerStep && isParallelStep(callerStep) ? (callerStep.parallel[taskIndex]?.task ?? "{previous}") : (callerChain ? "{previous}" : (t.task ?? "{previous}")), staticStep.sessionFile, behaviorCwd, progressPrecreated, parallelBehaviors[taskIndex], staticStep.index, { stepIndex, taskIndex });
 					}),
 					concurrency: s.concurrency,
 					failFast: s.failFast,
@@ -729,7 +739,7 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 				}
 				const maxItems = s.expand.maxItems ?? params.dynamicFanoutMaxItems ?? 0;
 				const dynamicFlatSteps = Array.from({ length: maxItems }, () => nextFlatStep());
-				const parallel = buildSeqStep(s.parallel as SequentialStep, undefined, undefined, progressPrecreated, behavior, undefined, { stepIndex });
+				const parallel = buildSeqStep(s.parallel as SequentialStep, callerStep && isDynamicParallelStep(callerStep) ? (callerStep.parallel.task ?? "{previous}") : (callerChain ? "{previous}" : (s.parallel.task ?? "{previous}")), undefined, undefined, progressPrecreated, behavior, undefined, { stepIndex });
 				return {
 					expand: s.expand,
 					parallel,
@@ -754,7 +764,7 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 				};
 			}
 			const staticStep = nextFlatStep();
-			return buildSeqStep(s as SequentialStep, staticStep.sessionFile, undefined, false, undefined, staticStep.index);
+			return buildSeqStep(s as SequentialStep, callerStep && !isParallelStep(callerStep) && !isDynamicParallelStep(callerStep) ? ((callerStep as SequentialStep).task ?? "{previous}") : (callerChain ? "{previous}" : ((s as SequentialStep).task ?? "{previous}")), staticStep.sessionFile, undefined, false, undefined, staticStep.index);
 		});
 		const steps = params.attachRoot
 			? [{
@@ -839,6 +849,7 @@ export function executeAsyncChain(
 
 	const built = buildAsyncRunnerSteps(id, {
 		chain,
+		callerChain: params.callerChain,
 		task: params.task,
 		attachRoot: params.attachRoot,
 		resultMode,
@@ -1070,6 +1081,7 @@ export function executeAsyncSingle(
 		nestedRoute,
 	} = params;
 	const task = params.task ?? "";
+	const callerTask = params.callerTask ?? task;
 	const runnerCwd = resolveChildCwd(ctx.cwd, cwd);
 	const skillNames = params.skills ?? agentConfig.skills ?? [];
 	const availableModels = params.availableModels;
@@ -1191,6 +1203,7 @@ export function executeAsyncSingle(
 						parentSessionId: ctx.parentSessionId ?? ctx.currentSessionId,
 						agent,
 						task: taskWithOutputInstruction,
+						callerTask,
 						...(params.context ? { context: params.context } : {}),
 						cwd: runnerCwd,
 						model,

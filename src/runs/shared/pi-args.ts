@@ -15,6 +15,9 @@ import { WAIT_TOOL_ENABLED_ENV } from "../background/wait-config.ts";
 import { PI_CODING_AGENT_PACKAGE_ROOT_ENV } from "../../shared/utils.ts";
 
 const TASK_ARG_LIMIT = 8000;
+const PI_LENS_STARTUP_MODE_ENV = "PI_LENS_STARTUP_MODE";
+const PI_LENS_COLD_START_QUICK_ENV = "PI_LENS_COLD_START_QUICK";
+const PI_LENS_SUBAGENT_FULL_ENV = "PI_LENS_SUBAGENT_FULL";
 const PROMPT_RUNTIME_EXTENSION_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), "subagent-prompt-runtime.ts");
 const FANOUT_CHILD_EXTENSION_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "extension", "fanout-child.ts");
 export const SUBAGENT_CHILD_ENV = "PI_SUBAGENT_CHILD";
@@ -97,6 +100,12 @@ function sanitizeSupervisorChannelSegment(value: string): string {
 
 function supervisorChannelDir(runId: string, agent: string, childIndex: number): string {
 	return path.join(TEMP_ROOT_DIR, "supervisor-channels", `${sanitizeSupervisorChannelSegment(runId)}-${sanitizeSupervisorChannelSegment(agent)}-${childIndex}`);
+}
+
+function applyPiLensChildStartupDefaults(env: Record<string, string | undefined>): void {
+	if (process.env[PI_LENS_STARTUP_MODE_ENV] !== undefined || process.env[PI_LENS_COLD_START_QUICK_ENV] !== undefined || process.env[PI_LENS_SUBAGENT_FULL_ENV] === "1") return;
+	env[PI_LENS_STARTUP_MODE_ENV] = "quick";
+	env[PI_LENS_COLD_START_QUICK_ENV] = "0";
 }
 
 export function applyThinkingSuffix(model: string | undefined, thinking: string | false | undefined, replaceExisting = false): string | undefined {
@@ -202,6 +211,7 @@ export function buildPiArgs(input: BuildPiArgsInput): BuildPiArgsResult {
 		env[CHILD_TOOL_DIAGNOSTIC_PATH_ENV] = toolDiagnosticPath;
 	}
 	env[SUBAGENT_CHILD_ENV] = "1";
+	applyPiLensChildStartupDefaults(env);
 	env[SUBAGENT_FANOUT_CHILD_ENV] = fanoutAuthorized ? "1" : "0";
 	if (input.waitToolEnabled !== undefined) {
 		env[WAIT_TOOL_ENABLED_ENV] = input.waitToolEnabled ? "true" : "false";
