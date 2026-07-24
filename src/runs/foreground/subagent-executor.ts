@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { type AgentConfig, type AgentScope } from "../../agents/agents.ts";
+import type { AgentConfig, AgentScope } from "../../agents/agents.ts";
 import { getArtifactsDir, getProjectChainRunsDir } from "../../shared/artifacts.ts";
 import { ChainClarifyComponent, type ChainClarifyResult } from "./chain-clarify.ts";
 import { toModelInfo, type ModelInfo } from "../../shared/model-info.ts";
@@ -3348,6 +3348,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 		ctx: ExtensionContext,
 	) => Promise<AgentToolResult<Details>>;
 } {
+	const delegatedThinkingOverrides = new WeakMap<object, AgentConfig["thinking"]>();
 	const execute = async (
 		_id: string,
 		params: SubagentParamsLike,
@@ -3355,6 +3356,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 		onUpdate: ((r: AgentToolResult<Details>) => void) | undefined,
 		ctx: ExtensionContext,
 	): Promise<AgentToolResult<Details>> => {
+		const delegatedThinkingOverride = delegatedThinkingOverrides.get(params);
 		deps.state.baseCwd = ctx.cwd;
 		deps.state.foregroundRuns ??= new Map();
 		deps.state.foregroundControls ??= new Map();
@@ -3822,11 +3824,11 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 			return forkSessionFileForIndex(idx);
 		};
 		const forkThinkingOverrideForTask: ForkThinkingOverrideForTask = (agentName, idx = 0, modelOverride) => {
-			if (!shouldForkAgent(contextPolicy, agentName)) return undefined;
+			if (!shouldForkAgent(contextPolicy, agentName)) return delegatedThinkingOverride;
 			prepareForkThinking(agentName, idx, modelOverride);
 			const override = forkThinkingOverrideForIndex(idx);
 			if (override === "off") forkThinkingDowngrades.set(idx, agentName);
-			return override;
+			return override ?? delegatedThinkingOverride;
 		};
 		const childSessionFileForTask: ForkSessionFileForTask = (agentName, idx, modelOverride) =>
 			forkSessionFileForTask(agentName, idx, modelOverride) ?? path.join(sessionDirForIndex(idx), "session.jsonl");
@@ -4034,5 +4036,20 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 		}
 	};
 
-	return { execute: executeWithSingleDispatchGuard, executeDelegated: execute };
+	const executeDelegated = async (
+		id: string,
+		params: SubagentParamsLike,
+		signal: AbortSignal,
+		onUpdate: ((r: AgentToolResult<Details>) => void) | undefined,
+		ctx: ExtensionContext,
+	): Promise<AgentToolResult<Details>> => {
+		const delegatedParams = { ...params };
+		const privateParams = delegatedParams as SubagentParamsLike & { delegatedThinkingOverride?: AgentConfig["thinking"] };
+		const thinkingOverride = privateParams.delegatedThinkingOverride;
+		delete privateParams.delegatedThinkingOverride;
+		if (thinkingOverride !== undefined) delegatedThinkingOverrides.set(delegatedParams, thinkingOverride);
+		return execute(id, delegatedParams, signal, onUpdate, ctx);
+	};
+
+	return { execute: executeWithSingleDispatchGuard, executeDelegated };
 }
