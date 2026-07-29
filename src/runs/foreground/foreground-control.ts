@@ -16,6 +16,10 @@ function copyProgress(target: ForegroundChildControl, progress: AgentProgress | 
 	target.currentPath = progress.currentPath;
 	target.turnCount = progress.turnCount;
 	target.tokens = progress.tokens;
+	target.inputTokens = progress.inputTokens;
+	target.outputTokens = progress.outputTokens;
+	target.model = progress.model;
+	target.thinking = progress.thinking;
 	target.toolCount = progress.toolCount;
 }
 
@@ -30,6 +34,10 @@ function syncCurrentChild(control: ForegroundRunControl, child: ForegroundChildC
 	control.currentPath = child.currentPath;
 	control.turnCount = child.turnCount;
 	control.tokens = child.tokens;
+	control.inputTokens = child.inputTokens;
+	control.outputTokens = child.outputTokens;
+	control.model = child.model;
+	control.thinking = child.thinking;
 	control.toolCount = child.toolCount;
 	control.interrupt = child.interrupt;
 	control.updatedAt = child.updatedAt;
@@ -45,6 +53,10 @@ function clearCurrentChild(control: ForegroundRunControl): void {
 	control.currentPath = undefined;
 	control.turnCount = undefined;
 	control.tokens = undefined;
+	control.inputTokens = undefined;
+	control.outputTokens = undefined;
+	control.model = undefined;
+	control.thinking = undefined;
 	control.toolCount = undefined;
 	control.interrupt = undefined;
 }

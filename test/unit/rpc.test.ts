@@ -42,11 +42,11 @@ function once(events: FakeEvents, event: string): Promise<unknown> {
 	});
 }
 
-function ctx() {
+function ctx(sessionId = "session-123") {
 	return {
 		cwd: "/repo",
 		sessionManager: {
-			getSessionId: () => "session-123",
+			getSessionId: () => sessionId,
 			getSessionFile: () => "/sessions/parent.jsonl",
 		},
 	} as any;
@@ -95,6 +95,10 @@ describe("subagent extension RPC bridge", () => {
 			(reply as { data: { capabilities?: { resume?: boolean } } }).data.capabilities?.resume,
 			true,
 		);
+		assert.deepEqual(
+			(reply as { data: { capabilities?: { fleetStatus?: unknown } } }).data.capabilities?.fleetStatus,
+			{ version: 1 },
+		);
 
 		bridge.dispose();
 	});
@@ -141,7 +145,149 @@ describe("subagent extension RPC bridge", () => {
 		assert.equal(reply.success, true);
 		assert.deepEqual(executedParams, { action: "status", id: "abc123" });
 		assert.equal((reply as { data: { text?: string } }).data.text, "Run: abc123");
+		assert.deepEqual((reply as { data: { fleet?: unknown } }).data.fleet, {
+			version: 1, entries: [], totalActive: 0, omitted: 0,
+		});
 
+		bridge.dispose();
+	});
+
+	it("projects bounded display-safe active fleet records without internal ids", async () => {
+		const events = new FakeEvents();
+		const state = {
+			currentSessionId: "session-123",
+			foregroundControls: new Map(),
+			asyncJobs: new Map([["async-private-id", {
+				asyncId: "async-private-id", sessionId: "session-123", status: "running", mode: "single",
+				description: ["Review", "\u001b]8;;hostile\u0007", "the diff"].join("\n"),
+				startedAt: 100, steps: [{ agent: "reviewer", label: "opaque label", status: "running", startedAt: 120, model: "anthropic/claude-opus-4-8:high", thinking: "high", tokens: { input: 12, output: 34, total: 46 } }],
+			}]]),
+		} as any;
+		const bridge = registerSubagentRpcBridge({
+			events, getContext: () => ctx(), state,
+			execute: async () => ({ content: [{ type: "text", text: "Active async runs: 1" }], details: { mode: "management", results: [] } } as any),
+		});
+		const reply = await request(events, "fleet-status", "status");
+		const fleet = (reply as { data: { fleet: { entries: Array<Record<string, unknown>> } } }).data.fleet;
+		assert.equal(fleet.entries.length, 1);
+		assert.equal((fleet as { totalActive?: number }).totalActive, 1);
+		assert.equal((fleet as { omitted?: number }).omitted, 0);
+		assert.deepEqual(fleet.entries[0], {
+			key: "fleet-1", agent: "reviewer", role: "opaque label", model: "anthropic/claude-opus-4-8:high", effort: "high",
+			startedAt: 120, tokens: { input: 12, output: 34, total: 46 }, goal: "Review the diff",
+		});
+		assert.equal(JSON.stringify(fleet).includes("async-private-id"), false);
+		bridge.dispose();
+	});
+
+	it("projects resolved foreground model, effort, split usage, and goal", async () => {
+		const events = new FakeEvents();
+		const state = {
+			currentSessionId: "session-123",
+			foregroundControls: new Map([["private-run", {
+				runId: "private-run",
+				sessionId: "session-123",
+				mode: "single",
+				startedAt: 90,
+				activeChildren: new Map([[0, {
+					index: 0,
+					agent: "worker",
+					description: "Implement the fix",
+					startedAt: 100,
+					updatedAt: 110,
+					model: "openai/gpt-5.6-terra:high",
+					thinking: "high",
+					inputTokens: 321,
+					outputTokens: 45,
+					tokens: 366,
+				}]]),
+			}]]),
+			asyncJobs: new Map(),
+		} as any;
+		state.foregroundControls.set("private-old", {
+			runId: "private-old",
+			sessionId: "old-session",
+			mode: "single",
+			startedAt: 50,
+			currentAgent: "reviewer",
+			description: "Old work",
+		});
+		const bridge = registerSubagentRpcBridge({
+			events,
+			getContext: () => ctx(),
+			state,
+			execute: async () => ({ content: [], details: { mode: "management", results: [] } } as any),
+		});
+		const reply = await request(events, "foreground-fleet", "status");
+		assert.deepEqual((reply as any).data.fleet, {
+			version: 1,
+			totalActive: 1,
+			omitted: 0,
+			entries: [{
+				key: "fleet-1",
+				agent: "worker",
+				model: "openai/gpt-5.6-terra:high",
+				effort: "high",
+				startedAt: 100,
+				tokens: { input: 321, output: 45, total: 366 },
+				goal: "Implement the fix",
+			}],
+		});
+		assert.equal(JSON.stringify((reply as any).data.fleet).includes("private-run"), false);
+		bridge.dispose();
+	});
+
+	it("uses monotonic opaque keys across removal/insertion and resets them per session", async () => {
+		const events = new FakeEvents();
+		const jobs = new Map<string, any>([
+			["private-a", { asyncId: "private-a", sessionId: "A", status: "running", mode: "single", startedAt: 1, agents: ["alpha"] }],
+			["private-b", { asyncId: "private-b", sessionId: "A", status: "running", mode: "single", startedAt: 2, agents: ["beta"] }],
+			["private-unattributed", { asyncId: "private-unattributed", status: "running", mode: "single", startedAt: 3, agents: ["unknown"] }],
+		]);
+		const state = { currentSessionId: "A", foregroundControls: new Map(), asyncJobs: jobs } as any;
+		let activeSession = "A";
+		const bridge = registerSubagentRpcBridge({ events, getContext: () => ctx(activeSession), state, execute: async () => ({ content: [], details: { mode: "management", results: [] } } as any) });
+		const keys = async (id: string) => ((await request(events, id, "status")) as any).data.fleet.entries.map((entry: { key: string }) => entry.key);
+		assert.deepEqual(await keys("keys-a"), ["fleet-1", "fleet-2"]);
+		jobs.delete("private-b"); jobs.set("private-c", { asyncId: "private-c", sessionId: "A", status: "running", mode: "single", startedAt: 3, agents: ["gamma"] });
+		assert.deepEqual(await keys("keys-b"), ["fleet-1", "fleet-3"]);
+		state.currentSessionId = "B";
+		activeSession = "B";
+		assert.deepEqual(await keys("keys-c"), []);
+		jobs.set("private-d", { asyncId: "private-d", sessionId: "B", status: "running", mode: "single", startedAt: 4, agents: ["delta"] });
+		assert.deepEqual(await keys("keys-d"), ["fleet-1"]);
+		bridge.dispose();
+	});
+
+	it("reports bounded overflow and excludes unattributed or foreign-session jobs", async () => {
+		const events = new FakeEvents();
+		const jobs = new Map<string, any>();
+		for (let index = 0; index < 18; index += 1) {
+			jobs.set(`private-${index}`, {
+				asyncId: `private-${index}`,
+				sessionId: "session-123",
+				status: "running",
+				mode: "single",
+				startedAt: index + 1,
+				agents: [`worker-${index}`],
+			});
+		}
+		jobs.set("unattributed", { asyncId: "unattributed", status: "running", mode: "single", startedAt: 20, agents: ["hidden"] });
+		jobs.set("foreign", { asyncId: "foreign", sessionId: "other", status: "running", mode: "single", startedAt: 21, agents: ["hidden"] });
+		const state = { currentSessionId: "session-123", foregroundControls: new Map(), asyncJobs: jobs } as any;
+		const bridge = registerSubagentRpcBridge({
+			events,
+			getContext: () => ctx(),
+			state,
+			execute: async () => ({ content: [], details: { mode: "management", results: [] } } as any),
+		});
+		const reply = await request(events, "fleet-overflow", "status");
+		const fleet = (reply as any).data.fleet;
+		assert.equal(fleet.entries.length, 16);
+		assert.equal(fleet.totalActive, 18);
+		assert.equal(fleet.omitted, 2);
+		assert.equal(JSON.stringify(fleet).includes("unattributed"), false);
+		assert.equal(JSON.stringify(fleet).includes("foreign"), false);
 		bridge.dispose();
 	});
 
