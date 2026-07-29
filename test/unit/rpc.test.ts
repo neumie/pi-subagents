@@ -42,12 +42,12 @@ function once(events: FakeEvents, event: string): Promise<unknown> {
 	});
 }
 
-function ctx(sessionId = "session-123") {
+function ctx(sessionId = "session-123", sessionFile = "/sessions/parent.jsonl") {
 	return {
 		cwd: "/repo",
 		sessionManager: {
 			getSessionId: () => sessionId,
-			getSessionFile: () => "/sessions/parent.jsonl",
+			getSessionFile: () => sessionFile,
 		},
 	} as any;
 }
@@ -155,16 +155,16 @@ describe("subagent extension RPC bridge", () => {
 	it("projects bounded display-safe active fleet records without internal ids", async () => {
 		const events = new FakeEvents();
 		const state = {
-			currentSessionId: "session-123",
+			currentSessionId: "/sessions/parent.jsonl",
 			foregroundControls: new Map(),
 			asyncJobs: new Map([["async-private-id", {
-				asyncId: "async-private-id", sessionId: "session-123", status: "running", mode: "single",
+				asyncId: "async-private-id", sessionId: "/sessions/parent.jsonl", status: "running", mode: "single",
 				description: ["Review", "\u001b]8;;hostile\u0007", "the diff"].join("\n"),
 				startedAt: 100, steps: [{ agent: "reviewer", label: "opaque label", status: "running", startedAt: 120, model: "anthropic/claude-opus-4-8:high", thinking: "high", tokens: { input: 12, output: 34, total: 46 } }],
 			}]]),
 		} as any;
 		const bridge = registerSubagentRpcBridge({
-			events, getContext: () => ctx(), state,
+			events, getContext: () => ctx("runtime-session-id", "/sessions/parent.jsonl"), state,
 			execute: async () => ({ content: [{ type: "text", text: "Active async runs: 1" }], details: { mode: "management", results: [] } } as any),
 		});
 		const reply = await request(events, "fleet-status", "status");
@@ -214,7 +214,7 @@ describe("subagent extension RPC bridge", () => {
 		});
 		const bridge = registerSubagentRpcBridge({
 			events,
-			getContext: () => ctx(),
+			getContext: () => ctx("session-123", "session-123"),
 			state,
 			execute: async () => ({ content: [], details: { mode: "management", results: [] } } as any),
 		});
@@ -246,7 +246,7 @@ describe("subagent extension RPC bridge", () => {
 		]);
 		const state = { currentSessionId: "A", foregroundControls: new Map(), asyncJobs: jobs } as any;
 		let activeSession = "A";
-		const bridge = registerSubagentRpcBridge({ events, getContext: () => ctx(activeSession), state, execute: async () => ({ content: [], details: { mode: "management", results: [] } } as any) });
+		const bridge = registerSubagentRpcBridge({ events, getContext: () => ctx(activeSession, activeSession), state, execute: async () => ({ content: [], details: { mode: "management", results: [] } } as any) });
 		const keys = async (id: string) => ((await request(events, id, "status")) as any).data.fleet.entries.map((entry: { key: string }) => entry.key);
 		assert.deepEqual(await keys("keys-a"), ["fleet-1", "fleet-2"]);
 		jobs.delete("private-b"); jobs.set("private-c", { asyncId: "private-c", sessionId: "A", status: "running", mode: "single", startedAt: 3, agents: ["gamma"] });
@@ -277,7 +277,7 @@ describe("subagent extension RPC bridge", () => {
 		const state = { currentSessionId: "session-123", foregroundControls: new Map(), asyncJobs: jobs } as any;
 		const bridge = registerSubagentRpcBridge({
 			events,
-			getContext: () => ctx(),
+			getContext: () => ctx("session-123", "session-123"),
 			state,
 			execute: async () => ({ content: [], details: { mode: "management", results: [] } } as any),
 		});
