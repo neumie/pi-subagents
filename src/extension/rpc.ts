@@ -547,7 +547,7 @@ async function handleRequest(
 			fleet: buildFleetStatus(
 				options.state,
 				fleetKeys,
-				ctx.sessionManager.getSessionId(),
+				resolveCurrentSessionId(ctx.sessionManager),
 			),
 		};
 	}
