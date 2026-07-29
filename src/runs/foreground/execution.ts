@@ -344,6 +344,10 @@ async function runSingleAttempt(
 		recentOutput: [...shared.attemptNotes],
 		toolCount: 0,
 		tokens: 0,
+		...(modelArg ? { model: modelArg } : {}),
+		...(resolvedThinking ? { thinking: resolvedThinking } : {}),
+		inputTokens: 0,
+		outputTokens: 0,
 		durationMs: 0,
 		lastActivityAt: startTime,
 	};
@@ -814,8 +818,13 @@ async function runSingleAttempt(
 						result.usage.cacheWrite += u.cacheWrite || 0;
 						result.usage.cost += u.cost?.total || 0;
 						progress.tokens = result.usage.input + result.usage.output;
+						progress.inputTokens = result.usage.input;
+						progress.outputTokens = result.usage.output;
 					}
-					if (!result.model && evt.message.model) result.model = evt.message.model;
+					if (evt.message.model) {
+						progress.model = evt.message.model;
+						if (!result.model) result.model = evt.message.model;
+					}
 					if (evt.message.errorMessage) assistantError = evt.message.errorMessage;
 					const assistantText = extractTextFromContent(evt.message.content);
 					appendRecentOutput(progress, assistantText.split("\n").slice(-10));
@@ -1444,7 +1453,9 @@ export async function runSync(
 				artifactPaths: artifactPathsResult,
 				transcriptWriter,
 				attemptNotes,
-				modelCandidates: candidates.map((modelCandidate) => applyThinkingSuffix(modelCandidate, options.thinkingOverride ?? agent.thinking, options.thinkingOverride !== undefined)),
+				modelCandidates: candidates
+					.map((modelCandidate) => applyThinkingSuffix(modelCandidate, options.thinkingOverride ?? agent.thinking, options.thinkingOverride !== undefined))
+					.filter((modelCandidate): modelCandidate is string => Boolean(modelCandidate)),
 				outputSnapshot,
 				originalTask: task,
 			});

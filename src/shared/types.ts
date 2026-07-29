@@ -566,6 +566,11 @@ export interface AgentProgress {
 	toolCount: number;
 	turnCount?: number;
 	tokens: number;
+	/** Resolved launch model/effort and split usage for public live projections. */
+	model?: string;
+	thinking?: string;
+	inputTokens?: number;
+	outputTokens?: number;
 	durationMs: number;
 	error?: string;
 	failedTool?: string;
@@ -1260,12 +1265,18 @@ export interface ForegroundChildControl {
 	currentPath?: string;
 	turnCount?: number;
 	tokens?: number;
+	inputTokens?: number;
+	outputTokens?: number;
+	model?: string;
+	thinking?: string;
 	toolCount?: number;
 	interrupt?: () => boolean;
 }
 
 export interface ForegroundRunControl {
 	runId: string;
+	/** Originating parent session; required for public fleet projection. */
+	sessionId?: string;
 	mode: SubagentRunMode;
 	startedAt: number;
 	updatedAt: number;
@@ -1282,6 +1293,10 @@ export interface ForegroundRunControl {
 	currentPath?: string;
 	turnCount?: number;
 	tokens?: number;
+	inputTokens?: number;
+	outputTokens?: number;
+	model?: string;
+	thinking?: string;
 	toolCount?: number;
 	/** Independently tracked children for foreground parallel work and fleet inspection. */
 	activeChildren?: Map<number, ForegroundChildControl>;

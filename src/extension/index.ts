@@ -389,6 +389,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		events: pi.events,
 		getContext: () => state.lastUiContext,
 		execute: (id, params, signal, onUpdate, ctx) => executor.execute(id, params, signal, onUpdate, ctx),
+		state,
 	});
 
 	function effectiveParallelTaskCount(tasks: Array<{ count?: unknown }> | undefined): number {
@@ -557,6 +558,8 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		state.lastUiContext = ctx;
 		cleanupSessionArtifacts(ctx);
 		clearPendingForegroundControlNotices(state);
+		state.foregroundControls.clear();
+		state.lastForegroundControlId = null;
 		resetJobs(ctx);
 		restoreActiveJobs(ctx);
 		scheduledRunManager.bindSession(ctx);

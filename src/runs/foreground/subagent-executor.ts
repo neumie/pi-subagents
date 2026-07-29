@@ -4095,6 +4095,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 			? undefined
 			: {
 				runId,
+				...(deps.state.currentSessionId ? { sessionId: deps.state.currentSessionId } : {}),
 				mode: foregroundMode,
 				startedAt: Date.now(),
 				updatedAt: Date.now(),

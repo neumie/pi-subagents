@@ -2,7 +2,13 @@
 
 ## [Unreleased]
 
+## [0.38.0] - 2026-07-29
+
+### Added
+- Added the optional versioned `fleetStatus` RPC capability with bounded, current-session child roles, goals, model/effort, split token usage, elapsed timestamps, stable opaque reconciliation keys, and explicit overflow counts.
+
 ### Fixed
+- Scoped foreground fleet records to their originating parent session and propagated resolved model, thinking effort, and split input/output usage through live foreground controls.
 - Kept pi-intercom stable IDs from leaking into child sessions and used the current intercom runtime ID for unnamed supervisor targets.
 - Improved acceptance policy validation errors and tool-schema guidance for invalid evidence kinds. Thanks to @atimofeev for #672.
 - Tolerated temporary steering inbox scan failures so pending steer requests can be retried on the next poll. Thanks to @hughcars for #670.
