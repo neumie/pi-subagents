@@ -93,6 +93,9 @@ function resolveConfiguredModel(ctx: ExtensionContext, rawModel: string): { mode
 	const availableModels = ctx.modelRegistry.getAvailable().map(toModelInfo);
 	const preferredProvider = typeof ctx.model?.provider === "string" ? ctx.model.provider : undefined;
 	const resolved = resolveModelCandidate(rawModel, availableModels, preferredProvider);
+	if (!resolved) {
+		throw new Error(`Configured watchdog model '${rawModel}' did not match exactly one authenticated available model. Use provider/model or configure credentials for the intended provider.`);
+	}
 	const { baseModel } = splitKnownThinkingSuffix(resolved);
 	const named = splitProviderModel(baseModel);
 	if (!named) {
@@ -268,7 +271,7 @@ export function createMainWatchdogReview(provider: WatchdogContextProvider, opti
 			...(options.createReadOnlyTools ?? createReadOnlyTools)(ctx.cwd).filter((tool) => WATCHDOG_ALLOWED_TOOL_NAMES.has(tool.name) && tool.name !== "watchdog_warn"),
 			createWatchdogWarnTool(request),
 		];
-		const agent = new Agent({
+		const agentOptions = {
 			initialState: {
 				systemPrompt: buildWatchdogSystemPrompt(ctx),
 				model: selection.model,
@@ -276,13 +279,16 @@ export function createMainWatchdogReview(provider: WatchdogContextProvider, opti
 				tools,
 			},
 			convertToLlm,
+			// Pi 0.83 renamed Agent's stream option; keep both keys while older peers remain supported.
+			streamFn,
 			streamFunction: streamFn,
-			getApiKey: (providerName) => providerName === selection.model.provider ? auth.apiKey : undefined,
-			beforeToolCall: async ({ toolCall }) => WATCHDOG_ALLOWED_TOOL_NAMES.has(toolCall.name)
+			getApiKey: (providerName: string) => providerName === selection.model.provider ? auth.apiKey : undefined,
+			beforeToolCall: async ({ toolCall }: { toolCall: { name: string } }) => WATCHDOG_ALLOWED_TOOL_NAMES.has(toolCall.name)
 				? undefined
 				: { block: true, reason: `Watchdog reviews are read-only; tool '${toolCall.name}' is not allowed.` },
-			toolExecution: "sequential",
-		});
+			toolExecution: "sequential" as const,
+		} as ConstructorParameters<typeof Agent>[0] & { streamFn: StreamFn; streamFunction: StreamFn };
+		const agent = new Agent(agentOptions);
 		const abort = () => agent.abort();
 		ctx.signal?.addEventListener("abort", abort, { once: true });
 		request.signal?.addEventListener("abort", abort, { once: true });

@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+## [0.38.1] - 2026-07-30
+
+### Fixed
+- Kept main watchdog reviews on their injected or registered provider stream across Pi's `Agent` stream option rename in 0.83.
+
 ## [0.38.0] - 2026-07-29
 
 ### Added
