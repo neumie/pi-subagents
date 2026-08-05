@@ -1,19 +1,24 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import { getMarkdownTheme, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Key, matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi, type Component, type MarkdownTheme } from "@earendil-works/pi-tui";
 import { getArtifactPaths, getArtifactsDir } from "../shared/artifacts.ts";
-import { formatDuration, formatTokens, shortenPath } from "../shared/formatters.ts";
-import { RESULTS_DIR, type AsyncJobState, type ForegroundChildControl, type ForegroundResumeChild, type ForegroundResumeRun, type ForegroundRunControl, type SubagentState } from "../shared/types.ts";
+import { formatDuration, formatModelThinking, formatTokens, shortenPath } from "../shared/formatters.ts";
+import { DIRS, type AsyncJobState, type Details, type ForegroundChildControl, type ForegroundResumeChild, type ForegroundResumeRun, type ForegroundRunControl, type SubagentState } from "../shared/types.ts";
 import { readStatus } from "../shared/utils.ts";
 import { formatAsyncRunTranscript } from "../runs/background/fleet-view.ts";
 import { listAsyncRuns, type AsyncRunSummary } from "../runs/background/async-status.ts";
+import { steerAsyncRun } from "../runs/foreground/async-steering-action.ts";
+import { stopAsyncRun } from "../runs/foreground/async-stop-action.ts";
 import { contextModeBadge, contextModeLabel } from "../runs/shared/context-mode.ts";
 import { FLEET_STATUS_WIDGET_KEY } from "./fleet-status.ts";
 import { readFleetTranscript, renderFleetTranscript, type FleetTranscript } from "./fleet-transcript.ts";
+import { handleHerdrInspectorAction } from "../inspectors/herdr/actions.ts";
 
 const REFRESH_MS = 750;
 const MAX_RECENT_ASYNC_RUNS = 20;
+const MAX_FLEET_HISTORY_CANDIDATES = 100;
 const TRANSCRIPT_LINES = 200;
 
 type Theme = ExtensionContext["ui"]["theme"];
@@ -34,12 +39,24 @@ export interface FleetSnapshot {
 	error?: string;
 }
 
+export interface FleetActionResult {
+	text: string;
+	isError?: boolean;
+}
+
+export interface FleetActionHandlers {
+	steer(input: { runId: string; asyncDir: string; index?: number; message: string }): Promise<FleetActionResult>;
+	stop(input: { runId: string; asyncDir: string; index?: number }): Promise<FleetActionResult> | FleetActionResult;
+	inspect?(input: { runId: string; asyncDir: string; index?: number }): Promise<FleetActionResult>;
+}
+
 export interface FleetViewOptions {
 	asyncDirRoot?: string;
 	resultsDir?: string;
 	refreshMs?: number;
 	initialKey?: string;
 	markdownTheme?: MarkdownTheme;
+	actions?: FleetActionHandlers;
 }
 
 function belongsToCurrentSession(sessionId: string | undefined, currentSessionId: string | null): boolean {
@@ -90,7 +107,7 @@ function trackedJobSummary(job: AsyncJobState): AsyncRunSummary {
 
 function asyncItems(run: AsyncRunSummary, description?: string): FleetItem[] {
 	const updatedAt = run.lastUpdate ?? run.endedAt ?? run.startedAt;
-	if (run.steps.length === 0) {
+	if (run.steps.length === 0 || run.mode === "workflow") {
 		return [{ key: `async:${run.id}`, kind: "async", runId: run.id, agent: run.mode, state: run.state, updatedAt, run, ...(description ? { description } : {}) }];
 	}
 	return run.steps.map((step) => ({
@@ -105,6 +122,14 @@ function asyncItems(run: AsyncRunSummary, description?: string): FleetItem[] {
 		step,
 		...(description ? { description } : {}),
 	}));
+}
+
+function orderFleetAsyncRuns(runs: AsyncRunSummary[], terminalLimit: number): AsyncRunSummary[] {
+	const updatedAt = (run: AsyncRunSummary) => run.lastUpdate ?? run.endedAt ?? run.startedAt;
+	const byNewest = (left: AsyncRunSummary, right: AsyncRunSummary) => updatedAt(right) - updatedAt(left);
+	const active = runs.filter((run) => run.state === "queued" || run.state === "running").sort(byNewest);
+	const terminal = runs.filter((run) => run.state !== "queued" && run.state !== "running").sort(byNewest);
+	return [...active, ...terminal.slice(0, terminalLimit)];
 }
 
 export function collectFleetSnapshot(
@@ -149,30 +174,35 @@ export function collectFleetSnapshot(
 	try {
 		let runs: AsyncRunSummary[];
 		const descriptions = new Map<string, string>();
-		if (options.asyncDirRoot !== undefined) {
-			runs = listAsyncRuns(options.asyncDirRoot, {
-				...(state.currentSessionId ? { sessionId: state.currentSessionId } : {}),
-				limit: options.limit ?? MAX_RECENT_ASYNC_RUNS,
-				resultsDir: options.resultsDir ?? RESULTS_DIR,
-				reconcile: false,
-			});
-		} else {
-			const tracked = [...(state.fleetJobs ?? state.asyncJobs).values()]
-				.filter((job) => belongsToCurrentSession(job.sessionId, state.currentSessionId));
-			const byUpdate = (left: AsyncJobState, right: AsyncJobState) => (right.updatedAt ?? right.startedAt ?? 0) - (left.updatedAt ?? left.startedAt ?? 0);
-			const active = tracked.filter((job) => job.status === "queued" || job.status === "running").sort(byUpdate);
-			const recent = tracked.filter((job) => job.status !== "queued" && job.status !== "running").sort(byUpdate).slice(0, options.limit ?? MAX_RECENT_ASYNC_RUNS);
-			runs = [];
-			for (const job of [...active, ...recent]) {
-				try {
-					runs.push(trackedJobSummary(job));
-					if (job.description) descriptions.set(job.asyncId, job.description);
-				} catch (cause) {
-					error = `Failed to inspect async run '${job.asyncId}': ${cause instanceof Error ? cause.message : String(cause)}`;
-				}
+		const tracked = [...(state.fleetJobs ?? state.asyncJobs).values()]
+			.filter((job) => belongsToCurrentSession(job.sessionId, state.currentSessionId));
+		const byUpdate = (left: AsyncJobState, right: AsyncJobState) => (right.updatedAt ?? right.startedAt ?? 0) - (left.updatedAt ?? left.startedAt ?? 0);
+		const active = tracked.filter((job) => job.status === "queued" || job.status === "running").sort(byUpdate);
+		const recent = tracked.filter((job) => job.status !== "queued" && job.status !== "running").sort(byUpdate).slice(0, options.limit ?? MAX_RECENT_ASYNC_RUNS);
+		const trackedRuns: AsyncRunSummary[] = [];
+		for (const job of [...active, ...recent]) {
+			try {
+				trackedRuns.push(trackedJobSummary(job));
+				if (job.description) descriptions.set(job.asyncId, job.description);
+			} catch (cause) {
+				error = `Failed to inspect async run '${job.asyncId}': ${cause instanceof Error ? cause.message : String(cause)}`;
 			}
 		}
-		for (const run of runs) items.push(...asyncItems(run, descriptions.get(run.id)));
+		if (options.asyncDirRoot !== undefined) {
+			const trackedIds = new Set(trackedRuns.map((run) => run.id));
+			const history = listAsyncRuns(options.asyncDirRoot, {
+				...(state.currentSessionId ? { sessionId: state.currentSessionId } : {}),
+				entryLimit: MAX_FLEET_HISTORY_CANDIDATES,
+				resultsDir: options.resultsDir ?? DIRS.results,
+				reconcile: false,
+			}).filter((run) => !trackedIds.has(run.id));
+			runs = [...trackedRuns, ...history];
+		} else {
+			runs = trackedRuns;
+		}
+		for (const run of orderFleetAsyncRuns(runs, options.limit ?? MAX_RECENT_ASYNC_RUNS)) {
+			items.push(...asyncItems(run, descriptions.get(run.id)));
+		}
 	} catch (cause) {
 		error = cause instanceof Error ? cause.message : String(cause);
 	}
@@ -209,12 +239,14 @@ function statusGlyph(item: FleetItem, theme: Theme): string {
 function foregroundActiveDetail(item: Extract<FleetItem, { kind: "foreground-active" }>): string[] {
 	const { control } = item;
 	const live = item.activeChild ?? control;
+	const modelThinking = formatModelThinking(live.model, live.thinking);
 	const lines = [
 		`Run: ${item.runId}`,
 		"Source: foreground",
 		`State: running`,
 		`Mode: ${control.mode}`,
 		item.index !== undefined ? `Child: ${item.index} (${item.agent})` : `Agent: ${item.agent}`,
+		modelThinking ? `Model: ${modelThinking}` : undefined,
 		`Started: ${new Date(live.startedAt).toISOString()}`,
 		live.currentTool ? `Current tool: ${live.currentTool}${live.currentPath ? ` · ${shortenPath(live.currentPath)}` : ""}` : undefined,
 		live.turnCount !== undefined ? `Turns: ${live.turnCount}` : undefined,
@@ -230,12 +262,14 @@ function foregroundActiveDetail(item: Extract<FleetItem, { kind: "foreground-act
 function foregroundRecentDetail(item: Extract<FleetItem, { kind: "foreground-recent" }>): string[] {
 	const { child, run } = item;
 	const outputPath = child.artifactPaths?.outputPath ?? child.savedOutputPath;
+	const modelThinking = formatModelThinking(child.model, child.thinking);
 	const lines = [
 		`Run: ${item.runId}`,
 		"Source: foreground",
 		`State: ${child.status}`,
 		`Mode: ${run.mode}`,
 		`Child: ${child.index} (${child.agent})${contextModeLabel(child.context) ? ` ${contextModeLabel(child.context)}` : ""}`,
+		modelThinking ? `Model: ${modelThinking}` : undefined,
 		`Updated: ${new Date(child.updatedAt ?? run.updatedAt).toISOString()}`,
 		outputPath ? `Output: ${outputPath}` : undefined,
 		child.sessionFile ? `Session: ${child.sessionFile}` : undefined,
@@ -280,6 +314,16 @@ function detailLines(item: FleetItem | undefined, error: string | undefined): st
 			: asyncDetail(item);
 	if (error) lines.unshift(`Fleet scan warning: ${error}`, "");
 	return lines;
+}
+
+function isActionableAsyncState(state: string): boolean {
+	return state === "running" || state === "queued" || state === "pending";
+}
+
+function firstToolResultText(result: AgentToolResult<Details> | null, fallback: string): FleetActionResult {
+	if (!result) return { text: fallback, isError: true };
+	const text = result.content.find((item) => item.type === "text")?.text ?? fallback;
+	return { text, ...(result.isError ? { isError: true } : {}) };
 }
 
 function uniquePaths(values: Array<string | undefined>): string[] {
@@ -353,10 +397,12 @@ function itemStats(item: FleetItem): string[] {
 	let durationMs: number | undefined;
 	if (item.kind === "foreground-active") {
 		const live = item.activeChild ?? item.control;
+		model = formatModelThinking(live.model, live.thinking) || undefined;
 		tokens = live.tokens;
 		tools = live.toolCount;
 		durationMs = Math.max(0, Date.now() - live.startedAt);
 	} else if (item.kind === "foreground-recent") {
+		model = formatModelThinking(item.child.model, item.child.thinking) || undefined;
 		tokens = item.child.tokens;
 		tools = item.child.toolCount;
 	} else {
@@ -436,6 +482,10 @@ export class SubagentFleetComponent implements Component {
 	private detailViewportHeight = 8;
 	private bodyHeight = 8;
 	private expandedTools = false;
+	private actionNotice: FleetActionResult | undefined;
+	private steerDraft: string | undefined;
+	private stopConfirming = false;
+	private actionBusy = false;
 	private transcriptCache: FleetTranscriptCache | undefined;
 	private disposed = false;
 	private readonly timer: ReturnType<typeof setInterval>;
@@ -482,7 +532,65 @@ export class SubagentFleetComponent implements Component {
 		this.selected = Math.max(0, Math.min(this.snapshot.items.length - 1, this.selected + delta));
 		this.selectedKey = this.snapshot.items[this.selected]?.key;
 		this.detailAutoFollow = true;
+		this.resetActionInput();
 		this.tui.requestRender();
+	}
+
+	private resetActionInput(): void {
+		this.steerDraft = undefined;
+		this.stopConfirming = false;
+	}
+
+	private selectedAsyncAction(): { item: Extract<FleetItem, { kind: "async" }> } | { reason: string } {
+		const item = this.snapshot.items[this.selected];
+		if (!item) return { reason: "No child is selected." };
+		if (item.kind !== "async") return { reason: "Fleet controls are available for current-session top-level async runs only." };
+		if (!isActionableAsyncState(item.run.state) || !isActionableAsyncState(item.state)) return { reason: `Selected child is ${item.state}; controls require a running or queued async child.` };
+		return { item };
+	}
+
+	private actionLines(): string[] {
+		const lines: string[] = [];
+		if (this.actionBusy) lines.push(this.theme.fg("accent", "Action pending..."));
+		if (this.steerDraft !== undefined) {
+			lines.push(this.theme.fg("accent", `Steer message: ${this.steerDraft}${this.theme.fg("dim", "▌")}`));
+			lines.push(this.theme.fg("dim", "Enter sends · Esc cancels · Backspace edits"));
+		} else if (this.stopConfirming) {
+			const selected = this.snapshot.items[this.selected];
+			lines.push(this.theme.fg("warning", `Confirm stop for async run ${selected?.runId ?? "selected run"}?`));
+			lines.push(this.theme.fg("dim", "Stop ends the run; use interrupt for a resumable pause. Enter/Y confirms · N returns · Esc cancels"));
+		} else if (this.actionNotice) {
+			lines.push(this.theme.fg(this.actionNotice.isError ? "error" : "success", this.actionNotice.text));
+		}
+		return lines;
+	}
+
+	private withActionLines(body: string[]): string[] {
+		const actionLines = this.actionLines();
+		return actionLines.length ? [...actionLines, "", ...body] : body;
+	}
+
+	private setActionNotice(result: FleetActionResult): void {
+		this.actionNotice = result;
+		this.resetActionInput();
+		this.detailAutoFollow = false;
+		this.detailScroll = 0;
+		this.refresh();
+		this.tui.requestRender();
+	}
+
+	private runAction(action: () => Promise<FleetActionResult>): void {
+		if (this.actionBusy) return;
+		this.actionBusy = true;
+		this.actionNotice = undefined;
+		this.tui.requestRender();
+		void action()
+			.then((result) => this.setActionNotice(result))
+			.catch((error) => this.setActionNotice({ text: error instanceof Error ? error.message : String(error), isError: true }))
+			.finally(() => {
+				this.actionBusy = false;
+				if (!this.disposed) this.tui.requestRender();
+			});
 	}
 
 	private scrollDetail(delta: number): void {
@@ -493,6 +601,53 @@ export class SubagentFleetComponent implements Component {
 	}
 
 	handleInput(data: string): void {
+		if (this.steerDraft !== undefined) {
+			if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c")) {
+				this.resetActionInput();
+				this.tui.requestRender();
+				return;
+			}
+			if (matchesKey(data, "return") || data === "\r" || data === "\n") {
+				const message = this.steerDraft.trim();
+				if (!message) {
+					this.setActionNotice({ text: "Steer message cannot be empty.", isError: true });
+					return;
+				}
+				const target = this.selectedAsyncAction();
+				if ("reason" in target || !this.options.actions) {
+					this.setActionNotice({ text: "reason" in target ? target.reason : "Fleet controls are unavailable in this context.", isError: true });
+					return;
+				}
+				this.runAction(() => this.options.actions!.steer({ runId: target.item.runId, asyncDir: target.item.run.asyncDir, ...(target.item.index !== undefined ? { index: target.item.index } : {}), message }));
+				return;
+			}
+			if (matchesKey(data, "backspace") || data === "\x7f") {
+				this.steerDraft = this.steerDraft.slice(0, -1);
+				this.tui.requestRender();
+				return;
+			}
+			if (data.length === 1 && data >= " " && data !== "\x7f") {
+				this.steerDraft += data;
+				this.tui.requestRender();
+			}
+			return;
+		}
+		if (this.stopConfirming) {
+			if (matchesKey(data, "return") || data.toLowerCase() === "y") {
+				const target = this.selectedAsyncAction();
+				if ("reason" in target || !this.options.actions) {
+					this.setActionNotice({ text: "reason" in target ? target.reason : "Fleet controls are unavailable in this context.", isError: true });
+					return;
+				}
+				this.runAction(() => Promise.resolve(this.options.actions!.stop({ runId: target.item.runId, asyncDir: target.item.run.asyncDir, ...(target.item.index !== undefined ? { index: target.item.index } : {}) })));
+				return;
+			}
+			if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c") || data.toLowerCase() === "n" || matchesKey(data, "backspace")) {
+				this.resetActionInput();
+				this.tui.requestRender();
+			}
+			return;
+		}
 		if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c") || matchesKey(data, "q")) {
 			this.done(undefined);
 			return;
@@ -509,6 +664,36 @@ export class SubagentFleetComponent implements Component {
 			this.transcriptCache = undefined;
 			this.refresh();
 			this.tui.requestRender();
+			return;
+		}
+		if (data === "s") {
+			const target = this.selectedAsyncAction();
+			if ("reason" in target || !this.options.actions) this.setActionNotice({ text: "reason" in target ? target.reason : "Fleet controls are unavailable in this context.", isError: true });
+			else {
+				this.actionNotice = undefined;
+				this.steerDraft = "";
+				this.detailAutoFollow = false;
+				this.detailScroll = 0;
+				this.tui.requestRender();
+			}
+			return;
+		}
+		if (data === "H") {
+			const target = this.selectedAsyncAction();
+			if ("reason" in target || !this.options.actions?.inspect) this.setActionNotice({ text: "reason" in target ? target.reason : "Herdr inspector controls are unavailable in this context.", isError: true });
+			else this.runAction(() => this.options.actions!.inspect!({ runId: target.item.runId, asyncDir: target.item.run.asyncDir, ...(target.item.index !== undefined ? { index: target.item.index } : {}) }));
+			return;
+		}
+		if (data === "D") {
+			const target = this.selectedAsyncAction();
+			if ("reason" in target || !this.options.actions) this.setActionNotice({ text: "reason" in target ? target.reason : "Fleet controls are unavailable in this context.", isError: true });
+			else {
+				this.actionNotice = undefined;
+				this.stopConfirming = true;
+				this.detailAutoFollow = false;
+				this.detailScroll = 0;
+				this.tui.requestRender();
+			}
 			return;
 		}
 		if (data.toLowerCase() === "x" || matchesKey(data, "ctrl+o")) {
@@ -567,7 +752,7 @@ export class SubagentFleetComponent implements Component {
 							: latest?.kind === "tool"
 								? `${latest.name} · ${latest.status}`
 								: "activity";
-					return { header: structuredHeader(selected, width, this.theme, conversationState), body };
+					return { header: structuredHeader(selected, width, this.theme, conversationState), body: this.withActionLines(body) };
 				}
 			}
 		}
@@ -576,7 +761,7 @@ export class SubagentFleetComponent implements Component {
 		if (transcriptWarning) raw.unshift(`Transcript preview warning: ${transcriptWarning}`, "");
 		const lines: string[] = [];
 		for (const line of raw) {
-			const styled = /^(Run|State|Mode|Source|Child|Agent):/.test(line)
+			const styled = /^(Run|State|Mode|Source|Child|Agent|Model):/.test(line)
 				? this.theme.bold(line)
 				: /^(Transcript|Result transcript tail)/.test(line)
 					? this.theme.fg("accent", line)
@@ -588,7 +773,7 @@ export class SubagentFleetComponent implements Component {
 			const wrapped = wrapTextWithAnsi(styled, Math.max(1, width));
 			lines.push(...(wrapped.length ? wrapped : [""]));
 		}
-		return { header: [], body: lines };
+		return { header: [], body: this.withActionLines(lines) };
 	}
 
 	render(width: number): string[] {
@@ -612,7 +797,7 @@ export class SubagentFleetComponent implements Component {
 		];
 		const lines = [this.theme.fg("border", `╭${"─".repeat(innerWidth)}╮`)];
 		const selected = this.snapshot.items[this.selected];
-		const title = ` ${this.theme.bold("Subagent fleet inspector")} ${this.theme.fg("dim", "· inspection only · live")}`;
+		const title = ` ${this.theme.bold("Subagent fleet inspector")} ${this.theme.fg("dim", "· live controls")}`;
 		const selectedStatus = selected
 			? `${statusGlyph(selected, this.theme)} ${selected.agent} · ${selected.state} `
 			: this.theme.fg("dim", "no children ");
@@ -629,7 +814,7 @@ export class SubagentFleetComponent implements Component {
 		}
 		lines.push(this.theme.fg("border", `├${"─".repeat(rosterWidth)}┴${"─".repeat(detailWidth)}┤`));
 		const position = this.snapshot.items.length ? `${this.selected + 1}/${this.snapshot.items.length}` : "0/0";
-		const footer = ` ↑↓/jk agent · ⇧k/⇧j scroll · PgUp/PgDn page · x/Ctrl+O tools · r refresh · Esc close · ${position}`;
+		const footer = ` ↑↓/jk agent · H Herdr · s steer · D stop · x/Ctrl+O tools · r refresh · Esc close · ${position}`;
 		lines.push(this.theme.fg("border", "│") + fit(this.theme.fg("dim", footer), innerWidth) + this.theme.fg("border", "│"));
 		lines.push(this.theme.fg("border", `╰${"─".repeat(innerWidth)}╯`));
 		return lines.map((line) => truncateToWidth(line, width));
@@ -650,9 +835,29 @@ export async function openSubagentFleet(ctx: ExtensionContext, state: SubagentSt
 	const wasOpen = state.fleetInspectorOpen === true;
 	state.fleetInspectorOpen = true;
 	if (typeof ctx.ui.setWidget === "function") ctx.ui.setWidget(FLEET_STATUS_WIDGET_KEY, undefined);
+	const actions = options.actions ?? {
+		steer: async (input: { runId: string; asyncDir: string; index?: number; message: string }) => firstToolResultText(await steerAsyncRun({
+			state,
+			runId: input.runId,
+			...(input.index !== undefined ? { index: input.index } : {}),
+			message: input.message,
+			location: { asyncDir: input.asyncDir, resolvedId: input.runId } as Parameters<typeof steerAsyncRun>[0]["location"],
+		}), `Failed to steer async run ${input.runId}.`),
+		stop: (input: { runId: string; asyncDir: string; index?: number }) => firstToolResultText(stopAsyncRun(state, input.runId, undefined, { asyncDir: input.asyncDir, resolvedId: input.runId }), `Failed to stop async run ${input.runId}.`),
+		inspect: async (input: { runId: string; asyncDir: string; index?: number }) => firstToolResultText(await handleHerdrInspectorAction("inspector.open", {
+			id: input.runId,
+			dir: input.asyncDir,
+			...(input.index !== undefined ? { index: input.index } : {}),
+		}, {
+			state,
+			cwd: state.baseCwd,
+			...(state.authorityPolicy ? { authorityPolicy: state.authorityPolicy } : {}),
+			...(state.missionStoreConfig ? { missions: state.missionStoreConfig } : {}),
+		}), `Failed to open Herdr inspector for async run ${input.runId}.`),
+	} satisfies FleetActionHandlers;
 	try {
 		await ctx.ui.custom<undefined>(
-			(tui, theme, _keybindings, done) => new SubagentFleetComponent(tui, theme, state, done, options),
+			(tui, theme, _keybindings, done) => new SubagentFleetComponent(tui, theme, state, done, { ...options, actions }),
 			{
 				overlay: true,
 				overlayOptions: { anchor: "center", width: "95%", minWidth: 60, maxHeight: "85%", margin: 1 },

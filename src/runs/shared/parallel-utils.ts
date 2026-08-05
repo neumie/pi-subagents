@@ -1,8 +1,13 @@
+export type ResolvedRunnerConfig = import("../../shared/types.ts").AgentRunnerConfig;
+
 export interface RunnerSubagentStep {
 	/** Session id of the direct parent session for permission-system ask forwarding. */
 	parentSessionId?: string;
+	/** Resolved opt-in rules for native Pi child tool calls. */
+	permissionRules?: import("./permissions.ts").PermissionRules;
 	agent: string;
 	task: string;
+	runner?: ResolvedRunnerConfig;
 	/** Resolved launch context for this child. */
 	context?: "fresh" | "fork";
 	importAsyncRoot?: {
@@ -46,6 +51,8 @@ export interface RunnerSubagentStep {
 	definitionDigest?: string;
 	launchBindingTask?: string;
 	launchContractDigest?: string;
+	launchResolvedExtensions?: import("../../shared/types.ts").LaunchResolvedChildExtensionsV1;
+	runtimeAcknowledgedExtensions?: import("../../shared/types.ts").RuntimeAcknowledgedChildExtensionsV1;
 	effectiveAcceptance?: import("../../shared/types.ts").ResolvedAcceptanceConfig;
 	acceptanceInput?: import("../../shared/types.ts").AcceptanceInput;
 	acceptanceRole?: import("../../shared/types.ts").AcceptanceRole;
@@ -53,6 +60,13 @@ export interface RunnerSubagentStep {
 	toolBudget?: import("../../shared/types.ts").ResolvedToolBudget;
 	capabilityCeiling?: import("./capability-ceiling.ts").ResolvedSubagentCapabilityCeiling;
 	capabilityAudit?: import("./capability-ceiling.ts").SubagentCapabilityAudit;
+}
+
+export interface RunnerCheckpointStep {
+	checkpoint: string;
+	message?: string;
+	phase?: string;
+	label?: string;
 }
 
 export interface ParallelStepGroup {
@@ -77,9 +91,15 @@ export interface DynamicRunnerGroup {
 	acceptanceRole?: import("../../shared/types.ts").AcceptanceRole;
 	agentContract?: import("../../shared/types.ts").AgentContract;
 	gateOn?: import("../../shared/types.ts").ChainGateLayer;
+	capabilityCeiling?: import("./capability-ceiling.ts").ResolvedSubagentCapabilityCeiling;
+	capabilityAudit?: import("./capability-ceiling.ts").SubagentCapabilityAudit;
 }
 
-export type RunnerStep = RunnerSubagentStep | ParallelStepGroup | DynamicRunnerGroup;
+export type RunnerStep = RunnerSubagentStep | ParallelStepGroup | DynamicRunnerGroup | RunnerCheckpointStep;
+
+export function isCheckpointRunnerStep(step: RunnerStep): step is RunnerCheckpointStep {
+	return "checkpoint" in step;
+}
 
 export function isParallelGroup(step: RunnerStep): step is ParallelStepGroup {
 	return "parallel" in step && Array.isArray(step.parallel);
@@ -92,7 +112,9 @@ export function isDynamicRunnerGroup(step: RunnerStep): step is DynamicRunnerGro
 export function flattenSteps(steps: RunnerStep[]): RunnerSubagentStep[] {
 	const flat: RunnerSubagentStep[] = [];
 	for (const step of steps) {
-		if (isParallelGroup(step)) {
+		if (isCheckpointRunnerStep(step)) {
+			continue;
+		} else if (isParallelGroup(step)) {
 			for (const task of step.parallel) flat.push(task);
 		} else if (isDynamicRunnerGroup(step)) {
 			continue;
@@ -144,29 +166,47 @@ export async function mapConcurrent<T, R>(
 	limit: number,
 	fn: (item: T, i: number) => Promise<R>,
 	globalSemaphore?: Semaphore,
+	/** Invoked after every worker has stopped, including workers outliving an early rejection. */
+	onSchedulingSettled?: () => void,
 ): Promise<R[]> {
 	const safeLimit = Math.max(1, Math.floor(limit) || 1);
 	const results: R[] = new Array(items.length);
 	let next = 0;
+	let liveWorkers = Math.min(safeLimit, items.length);
+	const notifySchedulingSettled = () => {
+		try {
+			onSchedulingSettled?.();
+		} catch {
+			// Scheduling lifecycle cleanup must not replace the worker result.
+		}
+	};
 
 	async function worker(_workerIndex: number): Promise<void> {
-		while (next < items.length) {
-			const i = next++;
-			if (globalSemaphore) {
-				await globalSemaphore.acquire();
-				try {
-					results[i] = await fn(items[i], i);
-				} finally {
-					globalSemaphore.release();
+		try {
+			while (next < items.length) {
+				const i = next++;
+				if (!(i in items)) throw new Error(`Missing parallel item at index ${i}`);
+				const item = items[i] as T;
+				if (globalSemaphore) {
+					await globalSemaphore.acquire();
+					try {
+						results[i] = await fn(item, i);
+					} finally {
+						globalSemaphore.release();
+					}
+				} else {
+					results[i] = await fn(item, i);
 				}
-			} else {
-				results[i] = await fn(items[i], i);
 			}
+		} finally {
+			liveWorkers--;
+			if (liveWorkers === 0) notifySchedulingSettled();
 		}
 	}
 
+	if (liveWorkers === 0) notifySchedulingSettled();
 	await Promise.all(
-		Array.from({ length: Math.min(safeLimit, items.length) }, (_, wi) => worker(wi)),
+		Array.from({ length: liveWorkers }, (_, wi) => worker(wi)),
 	);
 	return results;
 }

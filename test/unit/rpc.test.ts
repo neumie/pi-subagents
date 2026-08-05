@@ -318,7 +318,7 @@ describe("subagent extension RPC bridge", () => {
 		bridge.dispose();
 	});
 
-	it("preserves schema-valid static parallel extension fields", async () => {
+	it("allows direct managed worktree spawn requests", async () => {
 		const events = new FakeEvents();
 		let executedParams: any;
 		const bridge = registerSubagentRpcBridge({
@@ -326,20 +326,36 @@ describe("subagent extension RPC bridge", () => {
 			getContext: () => ctx(),
 			execute: async (_id, params) => {
 				executedParams = params;
-				return {
-					content: [{ type: "text", text: "Async: worker [run-1]" }],
-					details: { mode: "chain", results: [], asyncId: "run-1", asyncDir: "/tmp/run-1" },
-				} as any;
+				return { content: [{ type: "text", text: "Async: worker [run-1]" }], details: { mode: "single", results: [] } } as any;
 			},
 		});
 
-		const reply = await request(events, "spawn-chain-extra", "spawn", {
-			chain: [{ parallel: [{ agent: "worker", extensionField: true }] }],
-		});
+		const reply = await request(events, "spawn-worktree", "spawn", { agent: "worker", task: "Do work", worktree: true });
 
 		assert.equal(reply.success, true);
-		assert.equal(executedParams.chain[0].parallel[0].extensionField, true);
+		assert.equal(executedParams.worktree, true);
+		assert.equal(executedParams.async, true);
+		bridge.dispose();
+	});
 
+	it("rejects removed top-level chain and parallel spawn inputs", async () => {
+		const events = new FakeEvents();
+		let executeCalls = 0;
+		const bridge = registerSubagentRpcBridge({
+			events,
+			getContext: () => ctx(),
+			execute: async () => { executeCalls++; throw new Error("unreachable"); },
+		});
+
+		const chainReply = await request(events, "spawn-chain", "spawn", { chain: [{ agent: "worker" }] });
+		const parallelReply = await request(events, "spawn-parallel", "spawn", { tasks: [{ agent: "worker", task: "work" }] });
+		const worktreeReply = await request(events, "spawn-worktree", "spawn", { worktree: true });
+
+		assert.equal(chainReply.success, false);
+		assert.equal(parallelReply.success, false);
+		assert.equal(worktreeReply.success, false);
+		assert.match((chainReply as { error?: { message?: string } }).error?.message ?? "", /workflowScript/);
+		assert.equal(executeCalls, 0);
 		bridge.dispose();
 	});
 

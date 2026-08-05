@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import { discoverAgents, discoverAgentsAll, type AgentConfig, type AgentScope, type AgentSource } from "../agents/agents.ts";
+import { discoverAgents, discoverAgentsAll, resolveAgentName, type AgentConfig, type AgentScope, type AgentSource } from "../agents/agents.ts";
 import { resolveExecutionAgentScope } from "../agents/agent-scope.ts";
 import { buildSkillInjection, normalizeSkillInput, resolveSkillsWithFallback } from "../agents/skills.ts";
 import { buildAgentMemoryInjection } from "../agents/agent-memory.ts";
@@ -12,13 +12,13 @@ import { injectOutputPathSystemPrompt, normalizeSingleOutputOverride, resolveSin
 import { getArtifactPaths, getArtifactsDir } from "../shared/artifacts.ts";
 import { resolveEffectiveThinking } from "../shared/model-info.ts";
 import { SUBAGENT_LIFECYCLE_ARTIFACT_VERSION, type ArtifactDirPreference, type ArtifactPaths, type JsonSchemaObject, type OutputMode } from "../shared/types.ts";
-import type { ResolvedSubagentCapabilityCeiling, SubagentCapabilityAudit } from "../runs/shared/capability-ceiling.ts";
+import { capabilityCeilingAgentRestrictionMessage, intersectSubagentCapabilityCeilings, type ResolvedSubagentCapabilityCeiling, type SubagentCapabilityAudit } from "../runs/shared/capability-ceiling.ts";
 import { appendTurnBudgetSystemPrompt } from "../runs/shared/turn-budget.ts";
 import type { ResolvedTurnBudget } from "../shared/types.ts";
 import type { ResolvedMcpDirectToolSelection } from "../runs/shared/mcp-direct-tool-allowlist.ts";
 import { resolveStepBehavior } from "../shared/settings.ts";
 import { agentDefinitionDigest, AGENT_DEFINITION_PROJECTION_VERSION, launchBindingDigest } from "../shared/launch-contract.ts";
-import { ASYNC_DIR, RESULTS_DIR, TEMP_ROOT_DIR } from "../shared/types.ts";
+import { DIRS, TEMP_ROOT_DIR } from "../shared/types.ts";
 import { processTerminalCandidatePath, processTerminalPath } from "../runs/background/process-terminal.ts";
 import { nestedResultsPath } from "../runs/shared/nested-events.ts";
 
@@ -31,7 +31,8 @@ export type SubagentLaunchContractReasonCode =
 	| "denied_required_tool"
 	| "invalid_artifact_dir"
 	| "invalid_cwd"
-	| "unsupported_mode";
+	| "unsupported_mode"
+	| "restricted_agent";
 
 export interface SubagentLaunchContractDiagnostic {
 	code: SubagentLaunchContractReasonCode | "host_required" | "snapshot_warning";
@@ -191,7 +192,7 @@ function normalizeAvailableModels(models: SubagentLaunchContractInput["available
 function candidateList(inputAgent: string, selected: AgentConfig | undefined, cwd: string): SubagentLaunchContractAgentCandidate[] {
 	const all = discoverAgentsAll(cwd);
 	return [...all.builtin, ...all.package, ...all.user, ...all.project]
-		.filter((agent) => agent.name === inputAgent || agent.localName === inputAgent)
+		.filter((agent) => Boolean(resolveAgentName(inputAgent, [agent]).agent))
 		.map((agent) => ({
 			name: agent.name,
 			...(agent.localName ? { localName: agent.localName } : {}),
@@ -225,14 +226,17 @@ export async function resolveSubagentLaunchContract(input: SubagentLaunchContrac
 	}
 	const scope = resolveExecutionAgentScope(input.agentScope);
 	const discovered = discoverAgents(effectiveCwd, scope);
-	const matches = discovered.agents.filter((agent) => agent.name === input.agent || agent.localName === input.agent);
-	if (matches.length === 0) {
+	const resolvedAgent = resolveAgentName(input.agent, discovered.agents);
+	if (resolvedAgent.error) {
+		return { ok: false, code: "ambiguous_agent", message: resolvedAgent.error, diagnostics };
+	}
+	if (!resolvedAgent.agent) {
 		return { ok: false, code: "missing_agent", message: `Unknown agent: ${input.agent}`, diagnostics };
 	}
-	if (matches.length > 1) {
-		return { ok: false, code: "ambiguous_agent", message: `Ambiguous agent: ${input.agent}`, diagnostics };
-	}
-	const agent = matches[0]!;
+	const agent = resolvedAgent.agent;
+	const effectiveCapabilityCeiling = intersectSubagentCapabilityCeilings(input.capabilityCeiling, input.inheritedCapabilityCeiling);
+	const restrictionMessage = capabilityCeilingAgentRestrictionMessage(agent.name, effectiveCapabilityCeiling);
+	if (restrictionMessage) return { ok: false, code: "restricted_agent", message: restrictionMessage, diagnostics };
 	const runId = input.runId ?? "preflight";
 	const skillInput = normalizeSkillInput(input.skill);
 	const outputOverride = normalizeSingleOutputOverride(input.output, agent.output);
@@ -272,8 +276,8 @@ export async function resolveSubagentLaunchContract(input: SubagentLaunchContrac
 			cwd: effectiveCwd,
 			requireReadTool: resolvedSkills.resolved.length > 0,
 			structuredOutput: Boolean(input.outputSchema),
-			capabilityCeiling: input.capabilityCeiling,
-			inheritedCapabilityCeiling: input.inheritedCapabilityCeiling,
+			capabilityCeiling: effectiveCapabilityCeiling,
+			agentName: agent.name,
 		});
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
@@ -288,10 +292,10 @@ export async function resolveSubagentLaunchContract(input: SubagentLaunchContrac
 	const sessionDir = sessionRoot ? path.join(sessionRoot, "run-0") : undefined;
 	const lifecycleAsyncDir = input.nestedRootRunId
 		? path.join(TEMP_ROOT_DIR, "nested-subagent-runs", input.nestedRootRunId, runId)
-		: path.join(ASYNC_DIR, runId);
+		: path.join(DIRS.async, runId);
 	const lifecycleResultPath = input.nestedRootRunId
 		? nestedResultsPath(input.nestedRootRunId, runId)
-		: path.join(RESULTS_DIR, `${runId}.json`);
+		: path.join(DIRS.results, `${runId}.json`);
 	if (!sessionDir) diagnostics.push({ code: "host_required", severity: "host-required", message: "No sessionRoot/sessionDir was supplied; exact child session paths require the Pi host session-root policy." });
 	if (input.availableModels === undefined && (input.model || agent.model || input.parentModel)) {
 		diagnostics.push({ code: "host_required", severity: "host-required", message: "No availableModels snapshot was supplied; model resolution may differ from the active Pi host registry." });

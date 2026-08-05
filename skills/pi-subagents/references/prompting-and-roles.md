@@ -4,7 +4,7 @@ This file is a detailed reference loaded from `skills/pi-subagents/SKILL.md`.
 
 ## Capability ceilings
 
-Parent extensions may register a session-scoped, out-of-band ceiling through `pi-subagents/capability-ceiling`. Child tools are intersected with every active registration and inherited snapshot; `denyExtensions` removes ambient/provider extension loading while retaining package protocol runtime. Do not add a model-visible ceiling field or rely on role selection for enforcement. Restricted schedules are rejected until their ceiling can be persisted safely.
+Parent extensions may register a session-scoped, out-of-band ceiling through `pi-subagents/capability-ceiling`. Child tools and eligible canonical agent names are intersected with every active registration and inherited snapshot; `denyExtensions` removes ambient/provider extension loading while retaining package protocol runtime. `{ action: "list" }` marks non-allowlisted agents as restricted, and launch rejects them before spawn. Do not add a model-visible ceiling field or rely on unrestricted role selection for enforcement. Restricted schedules are rejected until their ceiling can be persisted safely.
 
 ## When to Use
 
@@ -24,18 +24,17 @@ Agents can use the `subagent(...)` tool directly for execution, management, stat
 Humans often use the slash-command layer instead:
 
 - `/run` — launch a single agent
-- `/chain` — launch a chain of steps
-- `/parallel` — launch top-level parallel tasks
-- `/run-chain` — launch a saved `.chain.md` or `.chain.json` workflow
+- `workflowScript` — the sole public surface for sequence, parallelism, branching, retries, and aggregation
 - `/subagents` — interactive admin for inspecting agents and editing model, thinking, or system prompt
 - `/subagents-stop [run-id]` — stop a current-session top-level async run; opens a selector when no id is given
+- `/subagents-detach [run-id]` — detach an active foreground single-subagent run without terminating its child
 - `/subagent-cost` — show parent plus child token usage and cost for the session
-- `/subagents-fleet` — open the live, inspection-only foreground/async fleet; `Ctrl+Alt+F` opens it during an active foreground turn, `↑↓`/`jk` selects children, and `PgUp`/`PgDn` scrolls transcript detail
+- `/subagents-fleet` — open the live fleet inspector with per-child controls; `Ctrl+Alt+F` opens it during an active foreground turn, `↑↓`/`jk` selects children, `PgUp`/`PgDn` scrolls transcript detail, `s` steers the selected live async child, and `D` stops its top-level async run after confirmation
 - `/subagents-watchdog` — inspect or configure the opt-in adversarial change watchdog (model, on/off, recommend-model, check)
 - `/subagents-doctor` — diagnose setup, discovery, async paths, and intercom bridge state
 - `/subagents-models [agent]` — show the live runtime-loaded builtin model mapping
 - `/subagents-profiles`, `/subagents-load-profile`, `/subagents-refresh-provider-models`, `/subagents-generate-profiles`, `/subagents-check-profile` — manage model profiles and provider catalogs
-- `/prompt-workflow` and `/chain-prompts` — run prompt templates through native subagent single/chain workflows
+- `/prompt-workflow` — run a prompt template through native single-agent or workflowScript execution
 
 Prefer the tool when you are writing agent logic. Prefer the slash commands when
 you are guiding a human through an interactive flow.
@@ -93,21 +92,18 @@ Use this when the question needs both external evidence and local implications. 
 
 ### Parallel context-build technique
 
-Use this before planning or implementation when a stronger handoff is needed. Run a chain with one parallel step of `context-builder` agents rather than top-level parallel tasks, so relative output files live under the temporary chain directory. Give every task a distinct output path such as `context-build/request-and-scope.md`, `context-build/codebase-and-patterns.md`, and `context-build/validation-and-risks.md`. Choose two or three builders: request/scope, codebase/patterns, and validation/risks. Each builder must read every relevant file needed to understand its slice, follow imports/callers/tests/docs/config, conduct tool-available web research when needed, and include a compact `meta-prompt` section. The parent synthesizes the outputs into important context, recommended next meta-prompt, open questions, assumptions, and artifact paths.
+Use this before planning or implementation when a stronger handoff is needed. Use `workflowScript` with `runs.all` to launch distinct `context-builder` lanes, each with an explicit output path. Give every task a distinct output path such as `context-build/request-and-scope.md`, `context-build/codebase-and-patterns.md`, and `context-build/validation-and-risks.md`. Choose two or three builders: request/scope, codebase/patterns, and validation/risks. Each builder must read every relevant file needed to understand its slice, follow imports/callers/tests/docs/config, conduct tool-available web research when needed, and include a compact `meta-prompt` section. The parent synthesizes the outputs into important context, recommended next meta-prompt, open questions, assumptions, and artifact paths.
 
 Example shape:
 
 ```typescript
-subagent({
-  chain: [{
-    parallel: [
-      { agent: "context-builder", task: "Build request/scope context for: ...", output: "context-build/request-and-scope.md" },
-      { agent: "context-builder", task: "Build codebase/pattern context for: ...", output: "context-build/codebase-and-patterns.md" },
-      { agent: "context-builder", task: "Build validation/risk context for: ...", output: "context-build/validation-and-risks.md" }
-    ]
-  }],
-  context: "fresh"
-})
+subagent({ workflowScript: `
+  const results = await runs.all([
+    { key: "lane-a", agent: "reviewer", task: "Inspect lane A" },
+    { key: "lane-b", agent: "reviewer", task: "Inspect lane B" }
+  ]);
+  return results.map(result => result.output);
+` })
 ```
 
 ### Parallel handoff-plan technique
@@ -117,17 +113,13 @@ Use this when the user needs a solution brief or implementation-ready handoff fr
 Example shape:
 
 ```typescript
-subagent({
-  chain: [
-    { parallel: [
-      { agent: "researcher", task: "Research the external reference and transferable implementation ideas for: ...", output: "handoff/external-reference.md" },
-      { agent: "context-builder", task: "Build local codebase context for: ...", output: "handoff/local-context.md" },
-      { agent: "context-builder", task: "Compare evidence and propose implementation strategy for: ...", output: "handoff/implementation-strategy.md" }
-    ] },
-    { agent: "context-builder", task: "Read {previous} and synthesize the final handoff plan and implementation-ready meta-prompt.", output: "handoff/final-handoff-plan.md" }
-  ],
-  context: "fresh"
-})
+subagent({ workflowScript: `
+  const results = await runs.all([
+    { key: "lane-a", agent: "reviewer", task: "Inspect lane A" },
+    { key: "lane-b", agent: "reviewer", task: "Inspect lane B" }
+  ]);
+  return results.map(result => result.output);
+` })
 ```
 
 ### Gather-context-and-clarify technique
@@ -148,7 +140,7 @@ Use this when a broad diff has known reviewer findings across several items and 
 
 Prefer `async: true`, `context: "fresh"` for planners/validators, `outputMode: "file-only"` for large summaries, and per-stage output names that will not collide. Add `phase` and `label` to make async status readable, and use `as` plus `{outputs.name}` when a later step needs a specific earlier result instead of the whole `{previous}` blob. Use this pattern instead of launching several writer workers into a dirty worktree. Include non-blocking suggestions in the writer prompt only when they are small, safe, and do not expand product scope; otherwise record them as deferred.
 
-When the first step can return a structured target list, prefer dynamic fanout instead of hand-authoring a static parallel group. Use `outputSchema` and `as` on the producer, then an `expand` step with `from: { output, path }`, an explicit `maxItems`, one `parallel` child template, and `collect.as`. Item templates may use `{item}` or a named item such as `{target.path}`. Do not use dynamic fanout for prose outputs, nested fanout, dynamic agent selection, reducers, `when` conditions, or arbitrary expressions; `.chain.md` does not support this syntax, so use direct JSON or a saved `.chain.json`.
+When one child returns a structured target list, use ordinary JavaScript to validate/filter it and map bounded entries into `runs.all`; do not use the removed chain fanout DSL.
 
 Example shape:
 
@@ -252,11 +244,24 @@ Direct settings example:
 }
 ```
 
-Useful override fields: `model`, `fallbackModels`, `thinking`,
+Useful override fields: `description`, `model`, `fallbackModels`, `thinking`,
 `systemPromptMode`, `inheritProjectContext`, `inheritSkills`, `defaultContext`,
 `acceptanceRole`, `disabled`, `skills`, `tools`, `extensions`, and `systemPrompt`.
+`description` replaces the discovered description for builtin and custom agents
+in `list` output, which is useful for deployment-specific routing notes.
 Use `acceptanceRole: false` to clear an override. Create a user or project
 agent with the same name only when you want a substantially different agent.
+
+### Recommended model tiering (optional)
+
+When several providers are available, route agents by task shape instead of one model for everything:
+
+1. **Fast workhorse** — cheapest capable model at low thinking for recon, lookups, and mechanical edits (for example on `scout`).
+2. **Standard well-scoped** — mid-tier model at medium thinking for most delegations: routine multi-file edits, focused reviews, straightforward implementation (for example on `worker`, `reviewer`, `delegate`).
+3. **Deep but bounded** — top reasoning model at high thinking only for hard tasks that arrive with explicit goals and completion criteria; these models loop on vague goals (for example on `planner` and oracle-style agents).
+4. **Taste and intent** — a model that reads human intent well for ambiguous work: UX/design judgment, product tradeoffs, planning from vague requirements, writing quality.
+
+Routing rule: use tiers 1–3 when the task is well-scoped; use tier 4 when scoping or judging is the task itself. Give tier-4 agents cross-provider `fallbackModels` so subscription usage limits degrade gracefully; fallback triggers automatically on rate-limit and overload errors. Note that forked context over an Anthropic parent transcript with signed thinking blocks forces the child's thinking off, so intent-tier agents work best with fresh context.
 
 If a provider rejects model IDs with thinking suffixes, use
 `subagents.disableThinking: true` in user or project settings to clear bundled

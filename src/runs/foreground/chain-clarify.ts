@@ -451,13 +451,13 @@ export class ChainClarifyComponent implements Component {
 			return;
 		}
 
-		if (matchesKey(data, "up")) {
+		if (matchesKey(data, "up") || matchesKey(data, "k")) {
 			this.selectedStep = Math.max(0, this.selectedStep - 1);
 			this.tui.requestRender();
 			return;
 		}
 
-		if (matchesKey(data, "down")) {
+		if (matchesKey(data, "down") || matchesKey(data, "j")) {
 			const maxStep = Math.max(0, this.agentConfigs.length - 1);
 			this.selectedStep = Math.min(maxStep, this.selectedStep + 1);
 			this.tui.requestRender();
@@ -775,22 +775,26 @@ export class ChainClarifyComponent implements Component {
 
 	private handleEditInput(data: string): void {
 		const textWidth = this.width - 4; // Must match render: innerW - 2 = (width - 2) - 2
-		if (matchesKey(data, "shift+up") || matchesKey(data, "pageup")) {
+		if (matchesKey(data, "shift+up") || matchesKey(data, "pageUp")) {
 			const { lines: wrapped, starts } = wrapText(this.editState.buffer, textWidth);
 			const cursorPos = getCursorDisplayPos(this.editState.cursor, starts);
 			const targetLine = Math.max(0, cursorPos.line - this.EDIT_VIEWPORT_HEIGHT);
+			const targetStart = starts[targetLine];
+			if (targetStart === undefined) return;
 			const targetCol = Math.min(cursorPos.col, wrapped[targetLine]?.length ?? 0);
-			this.editState = { ...this.editState, cursor: starts[targetLine] + targetCol };
+			this.editState = { ...this.editState, cursor: targetStart + targetCol };
 			this.tui.requestRender();
 			return;
 		}
 
-		if (matchesKey(data, "shift+down") || matchesKey(data, "pagedown")) {
+		if (matchesKey(data, "shift+down") || matchesKey(data, "pageDown")) {
 			const { lines: wrapped, starts } = wrapText(this.editState.buffer, textWidth);
 			const cursorPos = getCursorDisplayPos(this.editState.cursor, starts);
 			const targetLine = Math.min(wrapped.length - 1, cursorPos.line + this.EDIT_VIEWPORT_HEIGHT);
+			const targetStart = starts[targetLine];
+			if (targetStart === undefined) return;
 			const targetCol = Math.min(cursorPos.col, wrapped[targetLine]?.length ?? 0);
-			this.editState = { ...this.editState, cursor: starts[targetLine] + targetCol };
+			this.editState = { ...this.editState, cursor: targetStart + targetCol };
 			this.tui.requestRender();
 			return;
 		}
@@ -1123,7 +1127,7 @@ export class ChainClarifyComponent implements Component {
 	private getFooterText(): string {
 		return this.mode === 'single'
 			? " [Enter] Run • [Esc] Cancel "
-			: " [Enter] Run • [Esc] Cancel • [↑↓] Navigate ";
+			: " [Enter] Run • [Esc] Cancel • [↑↓/jk] Navigate ";
 	}
 
 	private appendNotice(lines: string[]): void {

@@ -269,6 +269,73 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 		}
 	});
 
+	it("restores workflow state and refreshes live workflow progress after reload", async () => {
+		const asyncRoot = createTempDir("pi-async-job-restore-workflow-");
+		try {
+			const runDir = path.join(asyncRoot, "workflow-run");
+			fs.mkdirSync(runDir, { recursive: true });
+			const statusPath = path.join(runDir, "status.json");
+			fs.writeFileSync(statusPath, JSON.stringify({
+				runId: "workflow-run",
+				mode: "workflow",
+				state: "running",
+				sessionId: "session-workflow",
+				startedAt: 1000,
+				lastUpdate: 2000,
+				steps: [{ agent: "scan", label: "scan", status: "running" }],
+				workflow: { trace: [{ operation: "run", key: "scan", state: "started" }], emits: [{ stage: "scan" }], console: [] },
+			}), "utf-8");
+			const state = createState();
+			state.currentSessionId = "session-workflow";
+			const tracker = trackerMod!.createAsyncJobTracker(createEventRecorder().pi, state as never, asyncRoot, { pollIntervalMs: 10 });
+			tracker.restoreActiveJobs();
+			assert.deepEqual(state.asyncJobs.get("workflow-run")?.workflow?.emits, [{ stage: "scan" }]);
+
+			fs.writeFileSync(statusPath, JSON.stringify({
+				runId: "workflow-run",
+				mode: "workflow",
+				state: "running",
+				sessionId: "session-workflow",
+				startedAt: 1000,
+				lastUpdate: 3000,
+				steps: [{ agent: "scan", label: "scan", status: "complete" }, { agent: "review", label: "review", status: "running" }],
+				workflow: { trace: [{ operation: "run", key: "review", state: "started" }], emits: [{ stage: "review" }], console: [] },
+			}), "utf-8");
+			await waitForCondition(() => JSON.stringify(state.asyncJobs.get("workflow-run")?.workflow?.emits) === JSON.stringify([{ stage: "review" }]), "workflow poll refresh", 1000);
+			assert.equal(state.asyncJobs.get("workflow-run")?.workflow?.trace[0]?.key, "review");
+			tracker.resetJobs();
+		} finally {
+			removeTempDir(asyncRoot);
+		}
+	});
+
+	it("restores async workflow child ownership after reload", () => {
+		const asyncRoot = createTempDir("pi-async-job-restore-workflow-child-");
+		try {
+			const runDir = path.join(asyncRoot, "workflow-child");
+			fs.mkdirSync(runDir, { recursive: true });
+			fs.writeFileSync(path.join(runDir, "status.json"), JSON.stringify({
+				runId: "workflow-child",
+				mode: "single",
+				state: "running",
+				sessionId: "session-workflow",
+				startedAt: 1000,
+				parentWorkflowRunId: "workflow-parent",
+				workflowKey: "review",
+				steps: [{ agent: "reviewer", status: "running" }],
+			}), "utf-8");
+			const state = createState();
+			state.currentSessionId = "session-workflow";
+			const tracker = trackerMod!.createAsyncJobTracker(createEventRecorder().pi, state as never, asyncRoot, { pollIntervalMs: 10 });
+			tracker.restoreActiveJobs();
+			assert.equal(state.asyncJobs.get("workflow-child")?.parentWorkflowRunId, "workflow-parent");
+			assert.equal(state.asyncJobs.get("workflow-child")?.workflowKey, "review");
+			tracker.resetJobs();
+		} finally {
+			removeTempDir(asyncRoot);
+		}
+	});
+
 	it("restores only active async runs for the current session", () => {
 		const asyncRoot = createTempDir("pi-async-job-restore-scope-");
 		try {
@@ -873,6 +940,69 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 			assert.equal(Math.max(...allocationSizes) <= 64 * 1024, true);
 		} finally {
 			Buffer.alloc = originalAlloc;
+			removeTempDir(asyncRoot);
+		}
+	});
+
+	it("resynchronizes when a saved cursor resumes inside an oversized JSONL record", async () => {
+		const asyncRoot = createTempDir("pi-async-job-tracker-");
+		const originalError = console.error;
+		const errors: unknown[][] = [];
+		console.error = (...args: unknown[]) => {
+			errors.push(args);
+		};
+		try {
+			const runDir = path.join(asyncRoot, "run-midline-oversized-control");
+			fs.mkdirSync(runDir, { recursive: true });
+			fs.writeFileSync(path.join(runDir, "status.json"), JSON.stringify({
+				runId: "run-midline-oversized-control",
+				mode: "single",
+				state: "running",
+				startedAt: Date.now() - 1000,
+				lastUpdate: Date.now(),
+				steps: [{ agent: "worker", status: "running" }],
+			}), "utf-8");
+			const largeDiagnostic = JSON.stringify({
+				type: "message_update",
+				message: { role: "assistant", content: [{ type: "text", text: "x".repeat(2_500_000) }] },
+			});
+			const controlEvent = JSON.stringify({
+				type: "subagent.control",
+				channels: ["event"],
+				event: {
+					type: "needs_attention",
+					to: "needs_attention",
+					ts: 123,
+					runId: "run-midline-oversized-control",
+					agent: "worker",
+					message: "worker needs attention",
+				},
+			});
+			fs.writeFileSync(path.join(runDir, "events.jsonl"), `${largeDiagnostic}\n${controlEvent}\n`, "utf-8");
+
+			const state = createState();
+			state.asyncJobs.set("run-midline-oversized-control", {
+				asyncId: "run-midline-oversized-control",
+				asyncDir: runDir,
+				status: "running",
+				agents: ["worker"],
+				startedAt: Date.now() - 1000,
+				updatedAt: Date.now(),
+				controlEventCursor: 0,
+			});
+			const recorder = createEventRecorder();
+			const tracker = trackerMod!.createAsyncJobTracker(recorder.pi, state as never, asyncRoot, {
+				pollIntervalMs: 10,
+			});
+			tracker.ensurePoller();
+
+			await waitForCondition(
+				() => recorder.events.some((event) => event.channel === "subagent:control-event"),
+				"control event after oversized diagnostic",
+			);
+			assert.equal(errors.some((args) => String(args[0]).includes("Ignoring malformed async control event")), false);
+		} finally {
+			console.error = originalError;
 			removeTempDir(asyncRoot);
 		}
 	});

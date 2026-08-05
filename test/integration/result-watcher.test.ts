@@ -75,6 +75,7 @@ describe("result watcher", () => {
 		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-native-delivery-"));
 		try {
 			const emitted: Array<{ event: string; data: unknown }> = [];
+			const delivered: unknown[] = [];
 			const pi = {
 				events: {
 					on: () => () => {},
@@ -89,15 +90,15 @@ describe("result watcher", () => {
 				runId: "native-run",
 				sessionId: "session-native",
 				mode: "single",
-				success: true,
-				state: "complete",
-				summary: "done",
-				results: [{ agent: "worker", output: "done", success: true }],
+				success: false,
+				state: "failed",
+				summary: "Subagent process terminated by signal SIGTERM.",
+				results: [{ agent: "worker", output: "", success: false, exitCode: 1, processSignal: "SIGTERM" }],
 				intercomTarget: "native-parent",
 			}), "utf-8");
 			const watcher = createResultWatcher(pi, state, resultsDir, 60_000, {
 				deliverIntercomResults: false,
-				notifier: { deliver: async () => true },
+				notifier: { deliver: async (result) => { delivered.push(result); return true; } },
 			});
 			try {
 				watcher.primeExistingResults();
@@ -107,6 +108,8 @@ describe("result watcher", () => {
 			}
 			assert.equal(emitted.some((entry) => entry.event === "subagent:result-intercom"), false);
 			assert.equal(emitted.filter((entry) => entry.event === "subagent:async-complete").length, 1);
+			const notification = delivered[0] as { results?: Array<{ status?: string }> } | undefined;
+			assert.equal(notification?.results?.[0]?.status, "stopped");
 			assert.equal(fs.existsSync(resultPath), false);
 		} finally {
 			fs.rmSync(resultsDir, { recursive: true, force: true });
@@ -489,8 +492,8 @@ describe("result watcher", () => {
 					state: "complete",
 					summary: "Combined summary",
 					results: [
-						{ agent: "a", output: "Result from a", success: true, sessionFile: firstSession, artifactPaths: { outputPath: "/tmp/a-output.md" }, intercomTarget: "subagent-a-run-123-1" },
-						{ agent: "b", output: "Result from b", success: false, sessionFile: missingSession, artifactPaths: { outputPath: "/tmp/b-output.md" }, intercomTarget: "subagent-b-run-123-2" },
+						{ agent: "a", output: "Result from a", outputState: "present", success: true, sessionFile: firstSession, artifactPaths: { outputPath: "/tmp/a-output.md" }, intercomTarget: "subagent-a-run-123-1" },
+						{ agent: "b", output: "Result from b", outputState: "present", success: false, sessionFile: missingSession, artifactPaths: { outputPath: "/tmp/b-output.md" }, intercomTarget: "subagent-b-run-123-2" },
 					],
 					sessionId: "session-1",
 					sessionFile: "/tmp/session.jsonl",
@@ -514,6 +517,8 @@ describe("result watcher", () => {
 			assert.match(message, /Revive child: subagent\(\{ action: "resume", id: "async-1", index: 0, message: "\.\.\." \}\)/);
 			assert.ok(message.includes(`Session: ${firstSession}`));
 			assert.match(message, /Parallel handoff: \/tmp\/async-1\/handoff\.json/);
+			assert.match(message, /Outputs: 2 present \(semantic adequacy unassessed\)/);
+			assert.match(message, /Inspect that output before retrying/);
 			assert.equal(message.includes(missingSession), false);
 			const completion = emitted.find((entry) => entry.event === "subagent:async-complete")?.data as { parallelHandoff?: { path?: string } } | undefined;
 			assert.equal(completion?.parallelHandoff?.path, "/tmp/async-1/handoff.json");
@@ -559,8 +564,8 @@ describe("result watcher", () => {
 					stopped: true,
 					summary: "Stopped by user",
 					results: [
-						{ agent: "a", output: "Result from a", success: true },
-						{ agent: "b", output: "Subagent stopped by user.", success: false, stopped: true, state: "stopped" },
+						{ agent: "a", output: "Result from a", outputState: "present", success: true },
+						{ agent: "b", output: "Subagent stopped by user.", outputState: "absent", success: false, stopped: true, state: "stopped" },
 					],
 					sessionId: "session-1",
 					intercomTarget: "subagent-chat-main",
@@ -577,8 +582,8 @@ describe("result watcher", () => {
 			assert.equal(eventData.status, "stopped");
 			const message = String(eventData.message ?? "");
 			assert.match(message, /Children: 1 completed, 1 stopped/);
-			assert.match(message, /1\. a — completed/);
-			assert.match(message, /2\. b — stopped/);
+			assert.match(message, /1\. a — process completed · output present/);
+			assert.match(message, /2\. b — process stopped · output absent/);
 		} finally {
 			fs.rmSync(resultsDir, { recursive: true, force: true });
 		}
@@ -919,8 +924,8 @@ describe("result watcher", () => {
 					state: "paused",
 					summary: "Paused after interrupt. Waiting for explicit next action.",
 					results: [
-						{ agent: "a", output: "Result from a", success: true, intercomTarget: "subagent-a-run-paused-1" },
-						{ agent: "b", output: "Paused after interrupt", success: false, intercomTarget: "subagent-b-run-paused-2" },
+						{ agent: "a", output: "Result from a", outputState: "present", success: true, intercomTarget: "subagent-a-run-paused-1" },
+						{ agent: "b", output: "Paused after interrupt", outputState: "absent", success: false, intercomTarget: "subagent-b-run-paused-2" },
 					],
 					sessionId: "session-1",
 					intercomTarget: "subagent-chat-main",
@@ -937,15 +942,15 @@ describe("result watcher", () => {
 			assert.equal(payload.mode, "chain");
 			assert.equal(payload.status, "paused");
 			assert.equal(payload.children?.every((child) => child.status === "paused"), true);
-			assert.match(String(payload.message ?? ""), /Status: paused/);
-			assert.match(String(payload.message ?? ""), /1\. a — paused/);
-			assert.match(String(payload.message ?? ""), /2\. b — paused/);
+			assert.match(String(payload.message ?? ""), /Process status: paused/);
+			assert.match(String(payload.message ?? ""), /1\. a — process paused · output present/);
+			assert.match(String(payload.message ?? ""), /2\. b — process paused · output absent/);
 		} finally {
 			fs.rmSync(resultsDir, { recursive: true, force: true });
 		}
 	});
 
-	it("logs one unacknowledged grouped async intercom delivery before completing", async () => {
+	it("uses local completion fallback silently when no grouped-result listener is available", async () => {
 		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-"));
 		try {
 			const emitted: Array<{ event: string; data: unknown }> = [];
@@ -961,7 +966,7 @@ describe("result watcher", () => {
 			};
 			const state = createState();
 			state.currentSessionId = "session-1";
-			const watcher = createResultWatcher(pi, state, resultsDir, 60_000);
+			const watcher = createResultWatcher(pi, state, resultsDir, 60_000, { deliverIntercomResults: false });
 			const originalError = console.error;
 			const logged: unknown[][] = [];
 			console.error = (...args: unknown[]) => {
@@ -979,20 +984,64 @@ describe("result watcher", () => {
 					intercomTarget: "orchestrator",
 				}), "utf-8");
 				watcher.primeExistingResults();
-				const deadline = Date.now() + 1000;
-				while (true) {
-					const sawWarning = logged.some((entry) => /Subagent async grouped result intercom delivery was not acknowledged/.test(String(entry[0] ?? "")));
-					const sawCompletion = emitted.some((entry) => entry.event === "subagent:async-complete");
-					if ((sawWarning && sawCompletion) || Date.now() > deadline) break;
-					await new Promise((resolve) => setTimeout(resolve, 25));
-				}
+				await new Promise((resolve) => setTimeout(resolve, 100));
+			} finally {
+				console.error = originalError;
+				watcher.stopResultWatcher();
+			}
+
+			assert.equal(emitted.some((entry) => entry.event === "subagent:result-intercom"), false);
+			assert.equal(emitted.some((entry) => entry.event === "subagent:async-complete"), true);
+			assert.equal(logged.some((entry) => /Subagent async grouped result intercom delivery was not acknowledged/.test(String(entry[0] ?? ""))), false);
+		} finally {
+			fs.rmSync(resultsDir, { recursive: true, force: true });
+		}
+	});
+
+	it("warns when an available grouped-result listener does not acknowledge delivery", async () => {
+		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-unacknowledged-listener-"));
+		try {
+			const emitted: Array<{ event: string; data: unknown }> = [];
+			const listeners = new Map<string, Set<(payload: unknown) => void>>();
+			const pi = {
+				events: {
+					on(event: string, handler: (payload: unknown) => void) {
+						const eventListeners = listeners.get(event) ?? new Set();
+						eventListeners.add(handler);
+						listeners.set(event, eventListeners);
+						return () => eventListeners.delete(handler);
+					},
+					emit(event: string, data: unknown) {
+						emitted.push({ event, data });
+						for (const handler of listeners.get(event) ?? []) handler(data);
+					},
+				},
+			};
+			const state = createState();
+			state.currentSessionId = "session-1";
+			const watcher = createResultWatcher(pi, state, resultsDir, 60_000);
+			const originalError = console.error;
+			const logged: unknown[][] = [];
+			console.error = (...args: unknown[]) => { logged.push(args); };
+			try {
+				fs.writeFileSync(path.join(resultsDir, "unacknowledged.json"), JSON.stringify({
+					id: "unacknowledged",
+					runId: "run-unacknowledged",
+					agent: "worker",
+					success: true,
+					state: "complete",
+					summary: "Worker summary",
+					sessionId: "session-1",
+					intercomTarget: "orchestrator",
+				}), "utf-8");
+				watcher.primeExistingResults();
+				await new Promise((resolve) => setTimeout(resolve, 600));
 			} finally {
 				console.error = originalError;
 				watcher.stopResultWatcher();
 			}
 
 			assert.equal(emitted.filter((entry) => entry.event === "subagent:result-intercom").length, 1);
-			assert.equal(emitted.some((entry) => entry.event === "subagent:async-complete"), true);
 			assert.equal(logged.some((entry) => /Subagent async grouped result intercom delivery was not acknowledged/.test(String(entry[0] ?? ""))), true);
 		} finally {
 			fs.rmSync(resultsDir, { recursive: true, force: true });

@@ -5,7 +5,7 @@ import * as path from "node:path";
 import { afterEach, describe, it } from "node:test";
 import registerFanoutChildSubagentExtension from "../../src/extension/fanout-child.ts";
 import { createSubagentExecutor } from "../../src/runs/foreground/subagent-executor.ts";
-import { createNestedRoute, projectNestedEvents, readNestedControlRequests, readNestedControlResults, writeNestedControlRequest, writeNestedControlResult, writeNestedEvent } from "../../src/runs/shared/nested-events.ts";
+import { createNestedRoute, findNestedControlResult, projectNestedEvents, readNestedControlRequests, readNestedControlResults, snapshotNestedEventFiles, writeNestedControlRequest, writeNestedControlResult, writeNestedEvent } from "../../src/runs/shared/nested-events.ts";
 import {
 	SUBAGENT_CHILD_ENV,
 	SUBAGENT_FANOUT_CHILD_ENV,
@@ -129,6 +129,25 @@ async function waitFor(predicate: () => boolean, timeoutMs = 1_000): Promise<voi
 }
 
 describe("nested control routing", () => {
+	it("finds a control result without considering files present before its request", () => {
+		const route = createNestedRoute("root-targeted-result");
+		routeRoots.push(path.dirname(route.eventSink));
+		const requestedAt = Date.now();
+		writeNestedControlResult(route, { ts: requestedAt, requestId: "older", targetRunId: "child", ok: true, message: "older result" });
+		writeNestedEvent(route, {
+			type: "subagent.nested.updated",
+			ts: requestedAt + 1,
+			parentRunId: route.rootRunId,
+			child: { id: "child", parentRunId: route.rootRunId, depth: 1, path: [], state: "running" },
+		});
+		const ignoredFiles = snapshotNestedEventFiles(route);
+		writeNestedControlResult(route, { ts: requestedAt - 1, requestId: "target", targetRunId: "child", ok: true, message: "target result" });
+
+		assert.equal(findNestedControlResult(route, "target", "child", ignoredFiles)?.message, "target result");
+		assert.equal(findNestedControlResult(route, "older", "child", ignoredFiles), undefined);
+		assert.equal(readNestedControlResults(route).length, 2);
+	});
+
 	it("routes interrupt to an explicit nested id through the control inbox", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-nested-control-"));
 		try {
@@ -245,11 +264,19 @@ describe("nested control routing", () => {
 		try {
 			const route = createNestedRun("nested-timeout");
 			const executor = createExecutor(stateWithNestedRoute(route));
-			setTimeout(() => {
-				const request = readNestedControlRequests(route)[0];
-				if (request) writeNestedControlResult(route, { ts: Date.now(), requestId: request.requestId, targetRunId: request.targetRunId, ok: true, message: "late success" });
-			}, 1_200);
+			const lateResponder = (async () => {
+				const deadline = Date.now() + 2_000;
+				let request = readNestedControlRequests(route)[0];
+				while (!request && Date.now() < deadline) {
+					await new Promise((resolve) => setTimeout(resolve, 10));
+					request = readNestedControlRequests(route)[0];
+				}
+				assert.ok(request, "expected a nested control request");
+				await new Promise((resolve) => setTimeout(resolve, 1_200));
+				writeNestedControlResult(route, { ts: Date.now(), requestId: request.requestId, targetRunId: request.targetRunId, ok: true, message: "late success" });
+			})();
 			const result = await executor.execute("interrupt", { action: "interrupt", id: "nested-timeout" }, new AbortController().signal, undefined, ctx(root));
+			await lateResponder;
 			assert.equal(result.isError, true);
 			assert.match(text(result), /owner is not reachable/);
 			assert.doesNotMatch(text(result), /late success/);

@@ -16,8 +16,10 @@ import {
 	SUBAGENT_STEER_INBOX_ENV,
 	SUBAGENT_SUPERVISOR_CHANNEL_DIR_ENV,
 } from "../../src/runs/shared/pi-args.ts";
+import { RUNTIME_EXTENSION_ACK_EVENT, RUNTIME_EXTENSION_ACK_PATH_ENV } from "../../src/runs/shared/runtime-acknowledged-extensions.ts";
 import { STRUCTURED_OUTPUT_CAPTURE_ENV, STRUCTURED_OUTPUT_SCHEMA_ENV } from "../../src/runs/shared/structured-output.ts";
 import { TOOL_BUDGET_ENV } from "../../src/runs/shared/tool-budget.ts";
+import { PERMISSION_POLICY_ENV } from "../../src/runs/shared/permissions.ts";
 import { CHILD_TOOL_DIAGNOSTIC_PATH_ENV, formatChildToolDiagnostic, MCP_DIRECT_CHILD_TOOLS_ENV, readChildToolDiagnostic, REQUIRED_CHILD_TOOLS_ENV } from "../../src/runs/shared/tool-availability.ts";
 import { CHILD_WATCHDOG_CONFIG_ENV } from "../../src/watchdog/child-status.ts";
 import { SUBAGENT_WATCHDOG_WARNING_TYPE } from "../../src/watchdog/types.ts";
@@ -25,6 +27,7 @@ import registerSubagentPromptRuntime, {
 	CHILD_FANOUT_BOUNDARY_INSTRUCTIONS,
 	CHILD_SUBAGENT_BOUNDARY_INSTRUCTIONS,
 	SUBAGENT_INTERCOM_SESSION_NAME_ENV,
+	registerPermissionGate,
 	registerSteeringInbox,
 	rewriteSubagentPrompt,
 	stripInheritedSkills,
@@ -43,7 +46,9 @@ const envSnapshot = {
 	PI_SUBAGENT_STEER_ACK_DIR: process.env.PI_SUBAGENT_STEER_ACK_DIR,
 	PI_SUBAGENT_STRUCTURED_OUTPUT_CAPTURE: process.env.PI_SUBAGENT_STRUCTURED_OUTPUT_CAPTURE,
 	PI_SUBAGENT_STRUCTURED_OUTPUT_SCHEMA: process.env.PI_SUBAGENT_STRUCTURED_OUTPUT_SCHEMA,
+	PI_SUBAGENT_RUNTIME_ACKNOWLEDGED_EXTENSIONS: process.env.PI_SUBAGENT_RUNTIME_ACKNOWLEDGED_EXTENSIONS,
 	PI_SUBAGENT_TOOL_BUDGET: process.env.PI_SUBAGENT_TOOL_BUDGET,
+	PI_SUBAGENT_PERMISSION_POLICY: process.env.PI_SUBAGENT_PERMISSION_POLICY,
 	PI_SUBAGENT_REQUIRED_TOOLS: process.env.PI_SUBAGENT_REQUIRED_TOOLS,
 	PI_SUBAGENT_MCP_DIRECT_TOOLS: process.env.PI_SUBAGENT_MCP_DIRECT_TOOLS,
 	PI_SUBAGENT_TOOL_DIAGNOSTIC_PATH: process.env.PI_SUBAGENT_TOOL_DIAGNOSTIC_PATH,
@@ -94,8 +99,12 @@ afterEach(() => {
 	else process.env[STRUCTURED_OUTPUT_CAPTURE_ENV] = envSnapshot.PI_SUBAGENT_STRUCTURED_OUTPUT_CAPTURE;
 	if (envSnapshot.PI_SUBAGENT_STRUCTURED_OUTPUT_SCHEMA === undefined) delete process.env[STRUCTURED_OUTPUT_SCHEMA_ENV];
 	else process.env[STRUCTURED_OUTPUT_SCHEMA_ENV] = envSnapshot.PI_SUBAGENT_STRUCTURED_OUTPUT_SCHEMA;
+	if (envSnapshot.PI_SUBAGENT_RUNTIME_ACKNOWLEDGED_EXTENSIONS === undefined) delete process.env[RUNTIME_EXTENSION_ACK_PATH_ENV];
+	else process.env[RUNTIME_EXTENSION_ACK_PATH_ENV] = envSnapshot.PI_SUBAGENT_RUNTIME_ACKNOWLEDGED_EXTENSIONS;
 	if (envSnapshot.PI_SUBAGENT_TOOL_BUDGET === undefined) delete process.env[TOOL_BUDGET_ENV];
 	else process.env[TOOL_BUDGET_ENV] = envSnapshot.PI_SUBAGENT_TOOL_BUDGET;
+	if (envSnapshot.PI_SUBAGENT_PERMISSION_POLICY === undefined) delete process.env[PERMISSION_POLICY_ENV];
+	else process.env[PERMISSION_POLICY_ENV] = envSnapshot.PI_SUBAGENT_PERMISSION_POLICY;
 	if (envSnapshot.PI_SUBAGENT_REQUIRED_TOOLS === undefined) delete process.env[REQUIRED_CHILD_TOOLS_ENV];
 	else process.env[REQUIRED_CHILD_TOOLS_ENV] = envSnapshot.PI_SUBAGENT_REQUIRED_TOOLS;
 	if (envSnapshot.PI_SUBAGENT_MCP_DIRECT_TOOLS === undefined) delete process.env[MCP_DIRECT_CHILD_TOOLS_ENV];
@@ -128,6 +137,69 @@ function setSupervisorEnv(): void {
 }
 
 describe("subagent prompt runtime", () => {
+	it("registers no permission hook by default and routes ask only to the watchdog arbiter", async () => {
+		const handlers: Array<(event: { toolName?: string; input?: unknown }, ctx?: unknown) => unknown> = [];
+		const pi = { on(event: string, handler: (event: { toolName?: string; input?: unknown }, ctx?: unknown) => unknown) { if (event === "tool_call") handlers.push(handler); } };
+		delete process.env[PERMISSION_POLICY_ENV];
+		registerPermissionGate(pi as never);
+		assert.equal(handlers.length, 0);
+
+		process.env[PERMISSION_POLICY_ENV] = JSON.stringify({ write: "deny" });
+		registerPermissionGate(pi as never);
+		assert.equal(handlers.length, 1);
+		assert.equal(await handlers[0]!({ toolName: "bash", input: { command: "rm -rf /" } }), undefined);
+		assert.equal(await handlers[0]!({ toolName: "contact_supervisor", input: {} }), undefined);
+		assert.deepEqual(await handlers[0]!({ toolName: "write", input: {} }), {
+			block: true,
+			reason: "Blocked by pi-subagents permission rule: 'write' is denied.",
+		});
+
+		process.env[PERMISSION_POLICY_ENV] = JSON.stringify({ write: "ask" });
+		const askHandlers: Array<(event: { toolName?: string; input?: unknown }, ctx: unknown) => unknown> = [];
+		const requests: Array<{ toolName: string; args: unknown }> = [];
+		registerPermissionGate({ on(event: string, handler: (event: { toolName?: string; input?: unknown }, ctx: unknown) => unknown) { if (event === "tool_call") askHandlers.push(handler); } } as never, async (request) => {
+			requests.push({ toolName: request.toolName, args: request.args });
+			return { approved: true, reason: "approved by watchdog", source: "watchdog" };
+		});
+		assert.equal(await askHandlers[0]!({ toolName: "write", input: { path: "out.txt" } }, { signal: undefined }), undefined);
+		assert.deepEqual(requests, [{ toolName: "write", args: { path: "out.txt" } }]);
+	});
+	it("collects runtime extension acknowledgements until terminal serialization", () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "subagent-runtime-ack-"));
+		try {
+			const outputPath = path.join(dir, "acks.json");
+			process.env[RUNTIME_EXTENSION_ACK_PATH_ENV] = outputPath;
+			const runtimeHandlers = new Map<string, Array<(payload?: unknown) => unknown>>();
+			const extensionHandlers = new Map<string, Array<(payload?: unknown) => unknown>>();
+			const pushHandler = (target: Map<string, Array<(payload?: unknown) => unknown>>, event: string, handler: (payload?: unknown) => unknown): void => {
+				target.set(event, [...(target.get(event) ?? []), handler]);
+			};
+			const emitAll = (target: Map<string, Array<(payload?: unknown) => unknown>>, event: string, payload?: unknown): void => {
+				for (const handler of target.get(event) ?? []) handler(payload);
+			};
+
+			registerSubagentPromptRuntime({
+				events: { on(event: string, handler: (payload?: unknown) => unknown) { pushHandler(extensionHandlers, event, handler); } },
+				on(event: string, handler: (payload?: unknown) => unknown) { pushHandler(runtimeHandlers, event, handler); },
+			} as never);
+
+			emitAll(extensionHandlers, RUNTIME_EXTENSION_ACK_EVENT, { id: "ext.one" });
+			emitAll(extensionHandlers, RUNTIME_EXTENSION_ACK_EVENT, { id: "ext.one" });
+			emitAll(extensionHandlers, RUNTIME_EXTENSION_ACK_EVENT, { id: "bad/path" });
+			runtimeHandlers.get("agent_end")?.[0]?.({});
+			emitAll(extensionHandlers, RUNTIME_EXTENSION_ACK_EVENT, { id: "late" });
+
+			assert.deepEqual(JSON.parse(fs.readFileSync(outputPath, "utf-8")), {
+				version: 1,
+				source: "child-runtime",
+				ids: ["ext.one"],
+				omitted: 0,
+			});
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
 	it("nudges after the tool budget soft limit and blocks configured tools after hard", () => {
 		const handlers = new Map<string, (payload: { toolName?: string }) => unknown>();
 		const sent: string[] = [];
@@ -299,6 +371,10 @@ describe("subagent prompt runtime", () => {
 	});
 
 	it("registers child watchdog lifecycle handlers only when enabled by env", () => {
+		delete process.env[CHILD_WATCHDOG_CONFIG_ENV];
+		// Clear the ack capture env explicitly: when this test suite itself runs inside a
+		// pi-subagents child, the runner sets it and an extra agent_end handler registers.
+		delete process.env[RUNTIME_EXTENSION_ACK_PATH_ENV];
 		const handlersWithout = new Map<string, unknown[]>();
 		registerSubagentPromptRuntime({
 			on(event: string, handler: unknown) {

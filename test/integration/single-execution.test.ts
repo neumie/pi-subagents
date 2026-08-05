@@ -13,6 +13,7 @@ import { describe, it, before, after, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { execFileSync } from "node:child_process";
 import type { MockPi } from "../support/helpers.ts";
 import {
 	createMockPi,
@@ -27,19 +28,14 @@ import {
 } from "../support/helpers.ts";
 import registerSubagentExtension from "../../src/extension/index.ts";
 import {
-	SUBAGENT_DELEGATION_PROTOCOL_VERSION,
-	SUBAGENT_DELEGATION_V2_PROTOCOL_VERSION,
 	SUBAGENT_DELEGATION_REQUEST_EVENT,
 	SUBAGENT_DELEGATION_RESPONSE_EVENT,
 	SUBAGENT_DELEGATION_STARTED_EVENT,
-	SUBAGENT_DELEGATION_UPDATE_EVENT,
+	type SubagentDelegationRequest,
 	type SubagentDelegationResponse,
-	type SubagentDelegationUpdate,
-	type SubagentDelegationV2Request,
-	type SubagentDelegationV2Response,
-	type SubagentDelegationV2Started,
+	type SubagentDelegationStarted,
 } from "../../src/api/delegation.ts";
-import { INTERCOM_DETACH_REQUEST_EVENT, INTERCOM_DETACH_RESPONSE_EVENT, type SubagentState } from "../../src/shared/types.ts";
+import { CHAIN_RUNS_DIR, DIRS, INTERCOM_DETACH_REQUEST_EVENT, INTERCOM_DETACH_RESPONSE_EVENT, type SubagentState } from "../../src/shared/types.ts";
 import { CHILD_WATCHDOG_STATUS_EVENT } from "../../src/watchdog/child-status.ts";
 import { WAIT_TOOL_ENABLED_ENV } from "../../src/runs/background/wait-config.ts";
 import { TOOL_BUDGET_ENV, TOOL_BUDGET_ZERO_AUTH_ENV } from "../../src/runs/shared/tool-budget.ts";
@@ -49,9 +45,11 @@ import {
 	SUBAGENT_FANOUT_CHILD_ENV,
 	SUBAGENT_PARENT_CHILD_INDEX_ENV,
 	SUBAGENT_PARENT_CONTROL_INBOX_ENV,
+	SUBAGENT_PARENT_DEPTH_ENV,
 	SUBAGENT_PARENT_EVENT_SINK_ENV,
 	SUBAGENT_PARENT_RUN_ID_ENV,
 } from "../../src/runs/shared/pi-args.ts";
+import { createNestedRoute, nestedRouteEnv, parseNestedEventRecords } from "../../src/runs/shared/nested-events.ts";
 
 interface ModelAttempt {
 	success?: boolean;
@@ -81,6 +79,22 @@ interface ArtifactPaths {
 	metadataPath?: string;
 }
 
+interface LaunchResolvedExtensions {
+	version?: number;
+	source?: string;
+	disableAmbientExtensions?: boolean;
+	runtime?: string[];
+	configured?: string[];
+	effective?: string[];
+}
+
+interface RuntimeAcknowledgedExtensions {
+	version?: number;
+	source?: string;
+	ids?: string[];
+	omitted?: number;
+}
+
 interface RunSyncResult {
 	exitCode: number;
 	agent: string;
@@ -99,6 +113,7 @@ interface RunSyncResult {
 	transcriptPath?: string;
 	transcriptError?: string;
 	finalOutput?: string;
+	processSignal?: string | null;
 	interrupted?: boolean;
 	timedOut?: boolean;
 	turnBudget?: { maxTurns: number; graceTurns: number; outcome: string; turnCount: number; wrapUpRequestedAtTurn?: number; exceededAtTurn?: number };
@@ -121,6 +136,8 @@ interface RunSyncResult {
 		verifyRuns?: Array<{ status?: string }>;
 		runtimeChecks?: Array<{ id?: string; status?: string; message?: string }>;
 	};
+	launchResolvedExtensions?: LaunchResolvedExtensions;
+	runtimeAcknowledgedExtensions?: RuntimeAcknowledgedExtensions;
 }
 
 interface MockPiCallRecord {
@@ -305,6 +322,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		initialSpawnState?: NonNullable<SubagentState["subagentSpawns"]>,
 		allowMutatingManagementActions = true,
 		initialAsyncJobs: SubagentState["asyncJobs"] = new Map(),
+		workflowControllers?: Map<string, AbortController>,
 	) {
 		return createSubagentExecutor!({
 			pi: { events: createEventBus(), getSessionName: () => undefined },
@@ -313,6 +331,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 				currentSessionId: initialSpawnState?.sessionId ?? null,
 				...(initialSpawnState ? { subagentSpawns: initialSpawnState } : {}),
 				asyncJobs: initialAsyncJobs,
+				...(workflowControllers ? { workflowControllers } : {}),
 				foregroundControls: new Map(),
 				lastForegroundControlId: null,
 			},
@@ -358,7 +377,418 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		assert.match(result.content[0]?.text ?? "", /single alias finished/);
 	});
 
-	it("admits a zero run-level tool budget only for marked v2 delegated execution", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+	it("starts workflow scripts asynchronously by default and persists live status", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		mockPi.onCall({ output: "async workflow child" });
+		const executor = makeExecutor([makeAgent("echo")]);
+		const runId = `scripted-workflow-async-${Date.now()}`;
+
+		const result = await executor.execute(
+			runId,
+			{ workflowScript: `emit("starting"); await runs.run("work", { agent: "echo", task: "Async work" }); return { answer: 42 };` },
+			new AbortController().signal,
+			undefined,
+			makeMinimalCtx(tempDir),
+		);
+
+		assert.equal(result.isError, undefined);
+		assert.equal(result.details.mode, "workflow");
+		assert.equal(result.details.asyncId, runId);
+		assert.match(result.content[0]?.text ?? "", /Async workflow/);
+		const statusPath = path.join(result.details.asyncDir!, "status.json");
+		let status: { state?: string; workflow?: { value?: unknown; emits?: unknown[]; trace?: Array<{ key?: string; state?: string }> } } = {};
+		for (let attempt = 0; attempt < 100; attempt++) {
+			status = JSON.parse(fs.readFileSync(statusPath, "utf-8"));
+			if (status.state === "complete" || status.state === "failed") break;
+			await new Promise((resolve) => setTimeout(resolve, 20));
+		}
+		assert.equal(status.state, "complete");
+		assert.deepEqual(status.workflow?.value, { answer: 42 });
+		assert.deepEqual(status.workflow?.emits, ["starting"]);
+		assert.ok(status.workflow?.trace?.some((entry) => entry.key === "work" && entry.state === "completed"));
+		const persistedResult = JSON.parse(fs.readFileSync(path.join(DIRS.results, `${runId}.json`), "utf-8")) as { agent?: string; summary?: string; workflow?: { value?: unknown } };
+		assert.equal(persistedResult.agent, "workflow");
+		assert.match(persistedResult.summary ?? "", /Return: \{\n  "answer": 42\n\}/);
+		assert.deepEqual(persistedResult.workflow?.value, { answer: 42 });
+		fs.rmSync(result.details.asyncDir!, { recursive: true, force: true });
+		fs.rmSync(path.join(DIRS.results, `${runId}.json`), { force: true });
+	});
+
+	it("rejects an invalid async workflow usage budget before creating run state", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		const asyncJobs: SubagentState["asyncJobs"] = new Map();
+		const executor = makeExecutor([makeAgent("echo")], {}, false, undefined, true, asyncJobs);
+		const runId = `scripted-workflow-invalid-budget-${Date.now()}`;
+
+		const result = await executor.execute(
+			runId,
+			{ workflowScript: `return "unreachable";`, usageBudget: { tokens: { hard: 0 } } },
+			new AbortController().signal,
+			undefined,
+			makeMinimalCtx(tempDir),
+		);
+
+		assert.equal(result.isError, true);
+		assert.match(result.content[0]?.text ?? "", /usageBudget\.tokens\.hard must be a positive number/);
+		assert.equal(result.details.asyncId, undefined);
+		assert.equal(asyncJobs.has(runId), false);
+		assert.equal(fs.existsSync(path.join(DIRS.async, runId)), false);
+		assert.equal(fs.existsSync(path.join(DIRS.results, `${runId}.json`)), false);
+	});
+
+	it("rejects async child launches from budgeted async workflows", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		const executor = makeExecutor([makeAgent("echo")]);
+		const runId = `scripted-workflow-budget-async-child-${Date.now()}`;
+		const started = await executor.execute(
+			runId,
+			{
+				workflowScript: `await runs.run("background", { agent: "echo", task: "Async child", async: true }); return "unreachable";`,
+				usageBudget: { tokens: { hard: 100 } },
+			},
+			new AbortController().signal,
+			undefined,
+			makeMinimalCtx(tempDir),
+		);
+
+		assert.equal(started.isError, undefined);
+		assert.equal(started.details.asyncId, runId);
+		const resultPath = path.join(DIRS.results, `${runId}.json`);
+		let persisted: { state?: string; summary?: string; results?: Array<{ success?: boolean; output?: string }> } = {};
+		for (let attempt = 0; attempt < 100; attempt++) {
+			if (fs.existsSync(resultPath)) persisted = JSON.parse(fs.readFileSync(resultPath, "utf-8"));
+			if (persisted.state === "failed") break;
+			await new Promise((resolve) => setTimeout(resolve, 20));
+		}
+		assert.equal(persisted.state, "failed");
+		assert.match(persisted.summary ?? "", /workflow usageBudget does not support async runs\.run launches/);
+		assert.equal(persisted.results?.length, 1);
+		assert.equal(persisted.results?.[0]?.success, false);
+		assert.match(persisted.results?.[0]?.output ?? "", /workflow usageBudget does not support async runs\.run launches/);
+		assert.equal(mockPi.callCount(), 0);
+		fs.rmSync(started.details.asyncDir!, { recursive: true, force: true });
+		fs.rmSync(resultPath, { force: true });
+	});
+
+	it("persists workflow parent metadata in an async worktree child status and result", { skip: !createSubagentExecutor || process.platform === "win32" ? "executor unavailable or worktree paths differ on Windows" : undefined }, async () => {
+		execFileSync("git", ["init"], { cwd: tempDir, stdio: "ignore" });
+		execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: tempDir });
+		execFileSync("git", ["config", "user.name", "Test User"], { cwd: tempDir });
+		fs.writeFileSync(path.join(tempDir, "base.txt"), "base\n", "utf-8");
+		execFileSync("git", ["add", "base.txt"], { cwd: tempDir });
+		execFileSync("git", ["commit", "-m", "base"], { cwd: tempDir, stdio: "ignore" });
+		mockPi.onCall({ output: "async child done" });
+		const executor = makeExecutor([makeAgent("echo")]);
+		const workflowRunId = `scripted-workflow-parent-${Date.now()}`;
+		const started = await executor.execute(
+			workflowRunId,
+			{ workflowScript: `const child = await runs.run("background", { agent: "echo", task: "Async child", async: true, worktree: true }); return child.runId;` },
+			new AbortController().signal,
+			undefined,
+			makeMinimalCtx(tempDir),
+		);
+		const workflowResultPath = path.join(DIRS.results, `${workflowRunId}.json`);
+		let childRunId: string | undefined;
+		for (let attempt = 0; attempt < 150; attempt++) {
+			if (fs.existsSync(workflowResultPath)) {
+				const workflowResult = JSON.parse(fs.readFileSync(workflowResultPath, "utf-8")) as { workflow?: { value?: unknown } };
+				if (typeof workflowResult.workflow?.value === "string") { childRunId = workflowResult.workflow.value; break; }
+			}
+			await new Promise((resolve) => setTimeout(resolve, 20));
+		}
+		assert.ok(childRunId);
+		const childDir = path.join(DIRS.async, childRunId);
+		const childStatusPath = path.join(childDir, "status.json");
+		let childStatus: { state?: string; mode?: string; parentWorkflowRunId?: string; workflowKey?: string; parallelHandoff?: { path?: string } } = {};
+		for (let attempt = 0; attempt < 200; attempt++) {
+			if (fs.existsSync(childStatusPath)) childStatus = JSON.parse(fs.readFileSync(childStatusPath, "utf-8"));
+			if (["complete", "failed", "stopped"].includes(childStatus.state ?? "")) break;
+			await new Promise((resolve) => setTimeout(resolve, 20));
+		}
+		assert.equal(childStatus.mode, "parallel");
+		assert.equal(childStatus.parentWorkflowRunId, workflowRunId);
+		assert.equal(childStatus.workflowKey, "background");
+		assert.equal(typeof childStatus.parallelHandoff?.path, "string");
+		const childResultPath = path.join(DIRS.results, `${childRunId}.json`);
+		for (let attempt = 0; attempt < 200 && !fs.existsSync(childResultPath); attempt++) {
+			await new Promise((resolve) => setTimeout(resolve, 20));
+		}
+		const childResult = JSON.parse(fs.readFileSync(childResultPath, "utf-8")) as { parentWorkflowRunId?: string; workflowKey?: string };
+		assert.equal(childResult.parentWorkflowRunId, workflowRunId);
+		assert.equal(childResult.workflowKey, "background");
+		fs.rmSync(started.details.asyncDir!, { recursive: true, force: true });
+		fs.rmSync(workflowResultPath, { force: true });
+		fs.rmSync(childDir, { recursive: true, force: true });
+		fs.rmSync(path.join(DIRS.results, `${childRunId}.json`), { force: true });
+	});
+
+	it("stops a live async workflow through its controller", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		const controller = new AbortController();
+		const executor = makeExecutor([makeAgent("echo")], {}, false, undefined, true, new Map(), new Map([["workflow-stop", controller]]));
+		const result = await executor.execute(
+			"stop-call",
+			{ action: "stop", id: "workflow-stop" },
+			new AbortController().signal,
+			undefined,
+			makeMinimalCtx(tempDir),
+		);
+		assert.equal(result.isError, undefined);
+		assert.equal(controller.signal.aborted, true);
+		assert.match(result.content[0]?.text ?? "", /Stop requested for async workflow workflow-stop/);
+	});
+
+	it("reports completed async workflows as not running when stopped after completion", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		const runId = `workflow-stop-complete-${Date.now()}`;
+		const asyncDir = path.join(DIRS.async, runId);
+		fs.mkdirSync(asyncDir, { recursive: true });
+		fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({
+			runId,
+			sessionId: "session-123",
+			mode: "workflow",
+			state: "complete",
+			startedAt: Date.now(),
+			lastUpdate: Date.now(),
+			cwd: tempDir,
+			pid: process.pid,
+		}), "utf-8");
+		const asyncJobs: SubagentState["asyncJobs"] = new Map([[runId, {
+			asyncId: runId,
+			asyncDir,
+			cwd: tempDir,
+			status: "complete",
+			mode: "workflow",
+			agents: [],
+			steps: [],
+			startedAt: Date.now(),
+			updatedAt: Date.now(),
+		}]]);
+		const executor = makeExecutor([makeAgent("echo")], {}, false, undefined, true, asyncJobs);
+
+		const result = await executor.execute(
+			"stop-completed-workflow",
+			{ action: "stop", id: runId },
+			new AbortController().signal,
+			undefined,
+			makeMinimalCtx(tempDir),
+		);
+
+		assert.equal(result.isError, true);
+		assert.match(result.content[0]?.text ?? "", /No running or queued async run was found/);
+		assert.doesNotMatch(result.content[0]?.text ?? "", /reload recovery/);
+		fs.rmSync(asyncDir, { recursive: true, force: true });
+	});
+
+	it("routes workflow script children through ordinary foreground execution", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		mockPi.onCall({ output: "scanned auth" });
+		mockPi.onCall({ output: "reviewed auth" });
+		const executor = makeExecutor([makeAgent("echo")]);
+
+		const result = await executor.execute(
+			"scripted-workflow",
+			{
+				async: false,
+				workflowScript: `
+					const scan = await runs.run("scan", { agent: "echo", task: "Scan auth" });
+					const review = await runs.run("review", { agent: "echo", task: "Review: " + scan.output });
+					return review.output;
+				`,
+			},
+			new AbortController().signal,
+			undefined,
+			makeMinimalCtx(tempDir),
+		);
+
+		assert.equal(result.isError, undefined);
+		assert.match(result.content[0]?.text ?? "", /reviewed auth/);
+		assert.equal(result.details.mode, "workflow");
+		assert.equal(result.details.results.length, 2);
+		assert.deepEqual(result.details.workflow?.trace.filter((entry) => entry.state === "completed").map((entry) => entry.key), ["scan", "review"]);
+	});
+
+	it("runs a direct single child in a managed worktree", { skip: !createSubagentExecutor || process.platform === "win32" ? "executor unavailable or worktree paths differ on Windows" : undefined }, async () => {
+		execFileSync("git", ["init"], { cwd: tempDir, stdio: "ignore" });
+		execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: tempDir });
+		execFileSync("git", ["config", "user.name", "Test User"], { cwd: tempDir });
+		fs.writeFileSync(path.join(tempDir, "base.txt"), "base\n", "utf-8");
+		execFileSync("git", ["add", "base.txt"], { cwd: tempDir });
+		execFileSync("git", ["commit", "-m", "base"], { cwd: tempDir, stdio: "ignore" });
+		mockPi.onCall({ output: "isolated feature", writeFiles: [{ path: "feature.txt", content: "feature\n" }] });
+		const executor = makeExecutor([makeAgent("worker")]);
+
+		const result = await executor.execute(
+			"direct-worktree",
+			{ async: false, agent: "worker", task: "Implement feature", worktree: true },
+			new AbortController().signal,
+			undefined,
+			makeMinimalCtx(tempDir),
+		);
+
+		assert.equal(result.isError, undefined);
+		assert.equal(mockPi.callCount(), 1);
+		assert.equal(fs.existsSync(path.join(tempDir, "feature.txt")), false);
+		const handoffPath = (result.content[0]?.text ?? "").match(/([^\s]+\/handoffs\/[^\s]+\.json)/)?.[1];
+		assert.ok(handoffPath, result.content[0]?.text);
+		const handoff = JSON.parse(fs.readFileSync(handoffPath, "utf-8")) as {
+			groups: Array<{
+				cleanup: { state: string; tasks: Array<{ worktreeRemoved: boolean }> };
+			}>;
+		};
+		assert.equal(handoff.groups[0]?.cleanup.state, "complete");
+		assert.equal(handoff.groups[0]?.cleanup.tasks[0]?.worktreeRemoved, true);
+
+	});
+
+	it("lets runs.all siblings settle when one child fails", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		mockPi.onCall({ exitCode: 1, stderr: "first child failed" });
+		mockPi.onCall({ output: "second child completed" });
+		const executor = makeExecutor([makeAgent("echo")]);
+
+		const result = await executor.execute(
+			"scripted-workflow-settlement",
+			{
+				async: false,
+				workflowScript: `
+					const children = await runs.all([
+						{ key: "first", agent: "echo", task: "First task" },
+						{ key: "second", agent: "echo", task: "Second task" }
+					]);
+					return children.map(({ key, ok, error }) => error === undefined ? { key, ok } : { key, ok, error });
+				`,
+			},
+			new AbortController().signal,
+			undefined,
+			makeMinimalCtx(tempDir),
+		);
+
+		assert.equal(result.isError, undefined, result.content[0]?.text ?? "workflow failed");
+		assert.equal(mockPi.callCount(), 2);
+		const value = result.details.workflow?.value as Array<{ key: string; ok: boolean; error?: string }>;
+		assert.deepEqual(value.map(({ key }) => key), ["first", "second"]);
+		assert.deepEqual(value.map(({ ok }) => ok).sort(), [false, true]);
+		const failed = value.find(({ ok }) => !ok);
+		const succeeded = value.find(({ ok }) => ok);
+		assert.match(failed?.error ?? "", /first child failed/);
+		assert.equal(succeeded?.error, undefined);
+		assert.deepEqual(result.details.workflow?.trace.filter((entry) => entry.state !== "started").map(({ state }) => state).sort(), ["completed", "failed"]);
+	});
+
+	it("gives parallel workflow children separate managed worktrees and durable handoffs", { skip: !createSubagentExecutor || process.platform === "win32" ? "executor unavailable or worktree paths differ on Windows" : undefined }, async () => {
+		execFileSync("git", ["init"], { cwd: tempDir, stdio: "ignore" });
+		execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: tempDir });
+		execFileSync("git", ["config", "user.name", "Test User"], { cwd: tempDir });
+		fs.writeFileSync(path.join(tempDir, "base.txt"), "base\n", "utf-8");
+		execFileSync("git", ["add", "base.txt"], { cwd: tempDir });
+		execFileSync("git", ["commit", "-m", "base"], { cwd: tempDir, stdio: "ignore" });
+		mockPi.onCall({ output: "feature a", writeFiles: [{ path: "feature-a.txt", content: "a\n" }] });
+		mockPi.onCall({ output: "feature b", writeFiles: [{ path: "feature-b.txt", content: "b\n" }] });
+		const executor = makeExecutor([makeAgent("worker")]);
+
+		const result = await executor.execute(
+			"scripted-workflow-worktrees",
+			{
+				async: false,
+				workflowScript: `
+					const children = await runs.all([
+						{ key: "feature-a", agent: "worker", task: "Implement A", worktree: true },
+						{ key: "feature-b", agent: "worker", task: "Implement B", worktree: true }
+					]);
+					return children.map(({ key, artifactPaths }) => ({ key, artifactPaths }));
+				`,
+			},
+			new AbortController().signal,
+			undefined,
+			makeMinimalCtx(tempDir),
+		);
+
+		assert.equal(result.isError, undefined);
+		assert.equal(mockPi.callCount(), 2);
+		assert.equal(fs.existsSync(path.join(tempDir, "feature-a.txt")), false);
+		assert.equal(fs.existsSync(path.join(tempDir, "feature-b.txt")), false);
+		const output = result.content[0]?.text ?? "";
+		const handoffPaths = [...output.matchAll(/"([^"\n]*\/handoffs\/[^"\n]+\.json)"/g)].map((match) => match[1]!);
+		assert.equal(handoffPaths.length, 2, output);
+		const worktreePaths = new Set<string>();
+		for (const handoffPath of handoffPaths) {
+			const handoff = JSON.parse(fs.readFileSync(handoffPath, "utf-8")) as {
+				groups: Array<{
+					children: Array<{ patch: { changed: boolean; path: string } }>;
+					cleanup: { state: string; tasks: Array<{ path: string; worktreeRemoved: boolean; branchRemoved: boolean }> };
+				}>;
+			};
+			assert.equal(handoff.groups.length, 1);
+			assert.equal(handoff.groups[0]?.children.length, 1);
+			assert.equal(handoff.groups[0]?.children[0]?.patch.changed, true);
+			assert.equal(fs.existsSync(handoff.groups[0]!.children[0]!.patch.path), true);
+			assert.equal(handoff.groups[0]?.cleanup.state, "complete");
+			assert.equal(handoff.groups[0]?.cleanup.tasks[0]?.worktreeRemoved, true);
+			assert.equal(handoff.groups[0]?.cleanup.tasks[0]?.branchRemoved, true);
+			worktreePaths.add(handoff.groups[0]!.cleanup.tasks[0]!.path);
+		}
+		assert.equal(worktreePaths.size, 2);
+		for (const worktreePath of worktreePaths) assert.equal(fs.existsSync(worktreePath), false);
+		assert.match(result.content[0]?.text ?? "", /handoffs/);
+	});
+
+	it("inherits workflow-level worktree isolation and allows a child opt-out", { skip: !createSubagentExecutor || process.platform === "win32" ? "executor unavailable or worktree paths differ on Windows" : undefined }, async () => {
+		execFileSync("git", ["init"], { cwd: tempDir, stdio: "ignore" });
+		execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: tempDir });
+		execFileSync("git", ["config", "user.name", "Test User"], { cwd: tempDir });
+		fs.writeFileSync(path.join(tempDir, "base.txt"), "base\n", "utf-8");
+		execFileSync("git", ["add", "base.txt"], { cwd: tempDir });
+		execFileSync("git", ["commit", "-m", "base"], { cwd: tempDir, stdio: "ignore" });
+		mockPi.onCall({ output: "isolated", writeFiles: [{ path: "isolated.txt", content: "isolated\n" }] });
+		mockPi.onCall({ output: "shared", writeFiles: [{ path: "shared.txt", content: "shared\n" }] });
+		const executor = makeExecutor([makeAgent("worker")]);
+
+		const result = await executor.execute(
+			"scripted-workflow-worktree-default",
+			{
+				async: false,
+				worktree: true,
+				workflowScript: `
+					const isolated = await runs.run("isolated", { agent: "worker", task: "Isolated" });
+					const shared = await runs.run("shared", { agent: "worker", task: "Shared", worktree: false });
+					return { isolated: isolated.artifactPaths, shared: shared.artifactPaths };
+				`,
+			},
+			new AbortController().signal,
+			undefined,
+			makeMinimalCtx(tempDir),
+		);
+
+		assert.equal(result.isError, undefined, result.content[0]?.text ?? "workflow failed");
+		assert.equal(fs.existsSync(path.join(tempDir, "isolated.txt")), false);
+		assert.equal(fs.readFileSync(path.join(tempDir, "shared.txt"), "utf-8"), "shared\n");
+		const output = result.content[0]?.text ?? "";
+		const handoffPaths = [...output.matchAll(/"([^"\n]*\/handoffs\/[^"\n]+\.json)"/g)].map((match) => match[1]!);
+		assert.equal(handoffPaths.length, 1, output);
+		assert.equal(fs.existsSync(handoffPaths[0]!), true);
+	});
+
+	it("applies a workflow usage budget across scripted child launches", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		mockPi.onCall({ output: "first result" });
+		const executor = makeExecutor([makeAgent("echo")]);
+
+		const result = await executor.execute(
+			"scripted-workflow-usage-budget",
+			{
+				async: false,
+				workflowScript: `
+					await runs.run("first", { agent: "echo", task: "First task" });
+					await runs.run("second", { agent: "echo", task: "Second task" });
+				`,
+				usageBudget: { tokens: { hard: 10 } },
+			},
+			new AbortController().signal,
+			undefined,
+			makeMinimalCtx(tempDir),
+		);
+
+		assert.equal(result.isError, true);
+		assert.match(result.content[0]?.text ?? "", /Usage budget exhausted/);
+		assert.equal(result.details.mode, "workflow");
+		assert.equal(mockPi.callCount(), 1);
+		assert.equal(result.details.usageBudget?.exhausted, true);
+	});
+
+	it("admits a zero run-level tool budget only for marked structured delegated execution", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
 		const zeroBudget = { hard: 0, block: "*" as const };
 		const params = { agent: "echo", task: "Answer without tools", toolBudget: zeroBudget };
 		const ctx = makeMinimalCtx(tempDir);
@@ -374,26 +804,27 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		assert.equal(ordinary.isError, true);
 		assert.match(ordinary.content[0]?.text ?? "", /toolBudget\.hard must be an integer >= 1/);
 
-		const v1Delegated = await executor.executeDelegated(
-			"v1-delegated-zero-budget",
+		const unmarkedDelegated = await executor.executeDelegated(
+			"unmarked-delegated-zero-budget",
 			params,
 			new AbortController().signal,
 			undefined,
 			ctx,
 		);
-		assert.equal(v1Delegated.isError, true);
-		assert.match(v1Delegated.content[0]?.text ?? "", /toolBudget\.hard must be an integer >= 1/);
+		assert.equal(unmarkedDelegated.isError, true);
+		assert.match(unmarkedDelegated.content[0]?.text ?? "", /toolBudget\.hard must be an integer >= 1/);
 
 		mockPi.onCall({ echoEnv: [TOOL_BUDGET_ENV, TOOL_BUDGET_ZERO_AUTH_ENV] });
-		const v2Delegated = await executor.executeDelegated(
-			"v2-delegated-zero-budget",
+		const structuredDelegated = await executor.executeDelegated(
+			"structured-delegated-zero-budget",
 			{ ...params, delegatedAllowZeroToolBudget: true },
 			new AbortController().signal,
 			undefined,
 			ctx,
 		);
-		assert.equal(v2Delegated.isError, undefined);
-		const env = JSON.parse(v2Delegated.content[0]?.text ?? "{}") as Record<string, string>;
+		assert.equal(structuredDelegated.isError, undefined);
+		assert.deepEqual(structuredDelegated.details.toolBudget, zeroBudget);
+		const env = JSON.parse(structuredDelegated.content[0]?.text ?? "{}") as Record<string, string>;
 		assert.deepEqual(JSON.parse(env[TOOL_BUDGET_ENV] ?? "null"), zeroBudget);
 		assert.equal(env[TOOL_BUDGET_ZERO_AUTH_ENV], "1");
 		assert.equal(mockPi.callCount(), 1);
@@ -432,6 +863,29 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 
 		assert.equal(result.isError, true);
 		assert.match(result.content[0]?.text ?? "", /acceptance level "none" requires a reason/);
+		assert.equal(mockPi.callCount(), 0);
+	});
+
+	it("rejects invalid verified acceptance before spawning", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		const executor = makeExecutor([makeAgent("echo")]);
+		const invalidPolicies = [
+			"verified",
+			{ level: "verified" },
+			{ level: "verified", verify: [] },
+		] as const;
+
+		for (const [index, acceptance] of invalidPolicies.entries()) {
+			const result = await executor.execute(
+				`invalid-verified-acceptance-${index}`,
+				{ agent: "echo", task: "Do work", acceptance: acceptance as never },
+				new AbortController().signal,
+				undefined,
+				makeMinimalCtx(tempDir),
+			);
+
+			assert.equal(result.isError, true);
+			assert.match(result.content[0]?.text ?? "", /(?:verified.*object form|verify.*at least one command)/i);
+		}
 		assert.equal(mockPi.callCount(), 0);
 	});
 
@@ -521,101 +975,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		assert.equal(mockPi.callCount(), 2);
 	});
 
-	it("routes registered strict v1 delegation through the concurrent executor", async () => {
-		mockPi.onCall({
-			steps: [
-				{ jsonl: [events.toolStart("read", { path: "package.json" })], delay: 20 },
-				{ jsonl: [events.toolEnd("read"), events.toolResult("read", "{}")], delay: 20 },
-				{ jsonl: [events.assistantMessage("registered first delegated call")] },
-			],
-		});
-		mockPi.onCall({ output: "registered second delegated call", delay: 100 });
-		const extensionEvents = createEventBus();
-		const runtimeHandlers = new Map<string, Array<(event: unknown, ctx: ReturnType<typeof makeMinimalCtx>) => void>>();
-		const fakePi = new Proxy({
-			events: extensionEvents,
-			on(event: string, handler: (event: unknown, ctx: ReturnType<typeof makeMinimalCtx>) => void) {
-				const handlers = runtimeHandlers.get(event) ?? [];
-				handlers.push(handler);
-				runtimeHandlers.set(event, handlers);
-				return () => runtimeHandlers.set(event, (runtimeHandlers.get(event) ?? []).filter((entry) => entry !== handler));
-			},
-			registerTool() {},
-			registerCommand() {},
-			registerShortcut() {},
-			registerMessageRenderer() {},
-			sendMessage() {},
-			getSessionName() { return undefined; },
-		}, {
-			get(target, prop) {
-				if (prop in target) return target[prop as keyof typeof target];
-				return () => undefined;
-			},
-		});
-		const ctx = {
-			...makeMinimalCtx(tempDir),
-			sessionManager: {
-				getSessionId: () => "registered-delegation-session",
-				getSessionFile: () => path.join(tempDir, "registered-delegation-session.jsonl"),
-				getEntries: () => [],
-			},
-		};
-		const responses: SubagentDelegationResponse[] = [];
-		const updates: SubagentDelegationUpdate[] = [];
-		extensionEvents.on(SUBAGENT_DELEGATION_RESPONSE_EVENT, (payload) => responses.push(payload as SubagentDelegationResponse));
-		extensionEvents.on(SUBAGENT_DELEGATION_UPDATE_EVENT, (payload) => updates.push(payload as SubagentDelegationUpdate));
-
-		try {
-			registerSubagentExtension(fakePi as never);
-			for (const handler of runtimeHandlers.get("session_start") ?? []) {
-				await handler({ reason: "startup" }, ctx);
-			}
-			extensionEvents.emit(SUBAGENT_DELEGATION_REQUEST_EVENT, {
-				version: SUBAGENT_DELEGATION_PROTOCOL_VERSION,
-				requestId: "registered-a",
-				agent: "worker",
-				task: "First registered delegated call",
-				context: "fresh",
-				cwd: tempDir,
-				agentContract: { version: 1 },
-			});
-			extensionEvents.emit(SUBAGENT_DELEGATION_REQUEST_EVENT, {
-				version: SUBAGENT_DELEGATION_PROTOCOL_VERSION,
-				requestId: "registered-b",
-				agent: "reviewer",
-				task: "Second registered delegated call",
-				context: "fresh",
-				cwd: tempDir,
-				agentContract: { version: 1 },
-			});
-
-			const callDeadlineAt = Date.now() + 30_000;
-			while (mockPi.callCount() < 2 && Date.now() < callDeadlineAt) {
-				await new Promise((resolve) => setTimeout(resolve, 20));
-			}
-			assert.equal(mockPi.callCount(), 2, "registered strict v1 requests should bypass the ordinary one-call guard");
-
-			const responseDeadlineAt = Date.now() + 30_000;
-			while (responses.length < 2 && Date.now() < responseDeadlineAt) {
-				await new Promise((resolve) => setTimeout(resolve, 20));
-			}
-			assert.deepEqual(responses.map((response) => response.requestId).sort(), ["registered-a", "registered-b"]);
-			assert.ok(responses.every((response) => response.status === "completed"));
-			assert.deepEqual(responses.map((response) => response.output).sort(), [
-				"registered first delegated call",
-				"registered second delegated call",
-			]);
-			const toolResponse = responses.find((response) => response.output === "registered first delegated call");
-			assert.ok(toolResponse);
-			assert.equal(updates.some((update) => update.requestId === toolResponse.requestId && update.currentTool === "read"), true);
-		} finally {
-			for (const handler of runtimeHandlers.get("session_shutdown") ?? []) {
-				await handler({}, ctx);
-			}
-		}
-	});
-
-	it("routes registered strict v2 text delegation through the concurrent executor", async () => {
+	it("routes registered structured text delegation through the concurrent executor", async () => {
 		const literalJsonText = '{"looks":"json"}';
 		mockPi.onCall({
 			steps: [
@@ -642,7 +1002,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 				},
 			],
 		});
-		mockPi.onCall({ output: "registered v2 second node", delay: 100 });
+		mockPi.onCall({ output: "registered structured second node", delay: 100 });
 		const extensionEvents = createEventBus();
 		const runtimeHandlers = new Map<string, Array<(event: unknown, ctx: ReturnType<typeof makeMinimalCtx>) => void>>();
 		const fakePi = new Proxy({
@@ -671,28 +1031,27 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 				getAvailable: () => [{ provider: "mock", id: "test-model", reasoning: true }],
 			},
 			sessionManager: {
-				getSessionId: () => "registered-delegation-v2-session",
-				getSessionFile: () => path.join(tempDir, "registered-delegation-v2-session.jsonl"),
+				getSessionId: () => "registered-delegation-session",
+				getSessionFile: () => path.join(tempDir, "registered-delegation-session.jsonl"),
 				getEntries: () => [],
 			},
 		};
-		const started: SubagentDelegationV2Started[] = [];
-		const responses: SubagentDelegationV2Response[] = [];
+		const started: SubagentDelegationStarted[] = [];
+		const responses: SubagentDelegationResponse[] = [];
 		extensionEvents.on(SUBAGENT_DELEGATION_STARTED_EVENT, (payload) => {
-			if ((payload as { version?: unknown }).version === SUBAGENT_DELEGATION_V2_PROTOCOL_VERSION) {
-				started.push(payload as SubagentDelegationV2Started);
+			if ((payload as { ownerRunId?: unknown }).ownerRunId === "owner-delegation") {
+				started.push(payload as SubagentDelegationStarted);
 			}
 		});
 		extensionEvents.on(SUBAGENT_DELEGATION_RESPONSE_EVENT, (payload) => {
-			if ((payload as { version?: unknown }).version === SUBAGENT_DELEGATION_V2_PROTOCOL_VERSION) {
-				responses.push(payload as SubagentDelegationV2Response);
+			if ((payload as { ownerRunId?: unknown }).ownerRunId === "owner-delegation") {
+				responses.push(payload as SubagentDelegationResponse);
 			}
 		});
 
 		const firstRequest = {
-			version: SUBAGENT_DELEGATION_V2_PROTOCOL_VERSION,
-			requestId: "registered-v2-a",
-			ownerRunId: "owner-v2",
+			requestId: "registered-a",
+			ownerRunId: "owner-delegation",
 			nodeId: "node-a",
 			agent: "worker",
 			task: "Return literal JSON-looking text",
@@ -701,11 +1060,10 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 			model: "mock/test-model",
 			thinking: "high",
 			result: { kind: "text" },
-		} satisfies SubagentDelegationV2Request;
+		} satisfies SubagentDelegationRequest;
 		const secondRequest = {
-			version: SUBAGENT_DELEGATION_V2_PROTOCOL_VERSION,
-			requestId: "registered-v2-b",
-			ownerRunId: "owner-v2",
+			requestId: "registered-b",
+			ownerRunId: "owner-delegation",
 			nodeId: "node-b",
 			agent: "reviewer",
 			task: "Run the second logical node",
@@ -714,7 +1072,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 			model: "mock/test-model",
 			thinking: "high",
 			result: { kind: "text" },
-		} satisfies SubagentDelegationV2Request;
+		} satisfies SubagentDelegationRequest;
 
 		try {
 			registerSubagentExtension(fakePi as never);
@@ -728,10 +1086,10 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 			while (mockPi.callCount() < 2 && responses.length < 2 && Date.now() < callDeadlineAt) {
 				await new Promise((resolve) => setTimeout(resolve, 20));
 			}
-			assert.equal(mockPi.callCount(), 2, `different V2 logical nodes should use the concurrent delegated execution path: ${JSON.stringify(responses)}`);
+			assert.equal(mockPi.callCount(), 2, `different logical nodes should use the concurrent delegated execution path: ${JSON.stringify(responses)}`);
 			assert.deepEqual(started.map(({ requestId, ownerRunId, nodeId }) => ({ requestId, ownerRunId, nodeId })).sort((a, b) => a.nodeId.localeCompare(b.nodeId)), [
-				{ requestId: "registered-v2-a", ownerRunId: "owner-v2", nodeId: "node-a" },
-				{ requestId: "registered-v2-b", ownerRunId: "owner-v2", nodeId: "node-b" },
+				{ requestId: "registered-a", ownerRunId: "owner-delegation", nodeId: "node-a" },
+				{ requestId: "registered-b", ownerRunId: "owner-delegation", nodeId: "node-b" },
 			]);
 
 			const responseDeadlineAt = Date.now() + 30_000;
@@ -743,7 +1101,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 			const terminalResponses = responses.filter((response) => response.status !== "invalid_request");
 			assert.equal(terminalResponses.length, 2);
 			for (const response of terminalResponses) {
-				assert.equal(response.ownerRunId, "owner-v2");
+				assert.equal(response.ownerRunId, "owner-delegation");
 				assert.equal(response.model, "mock/test-model:high");
 				assert.equal(response.thinking, "high");
 				assert.match(response.launchContractDigest ?? "", /^[0-9a-f]{64}$/);
@@ -769,7 +1127,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 				toolCalls: 1,
 			});
 			assert.equal(typeof literalResponse.usage?.durationMs, "number");
-			const plainResponse = terminalResponses.find((response) => response.result?.kind === "text" && response.result.text === "registered v2 second node");
+			const plainResponse = terminalResponses.find((response) => response.result?.kind === "text" && response.result.text === "registered structured second node");
 			assert.ok(plainResponse);
 		} finally {
 			for (const handler of runtimeHandlers.get("session_shutdown") ?? []) {
@@ -1051,6 +1409,97 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		assert.deepEqual(result.details?.totalCost, { inputTokens: 100, outputTokens: 50, costUsd: 0.001 });
 	});
 
+	it("emits resolved model and thinking for nested foreground starts", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		mockPi.onCall({ output: "nested result" });
+		const route = createNestedRoute("root-nested-model");
+		const envPatch = {
+			...nestedRouteEnv(route),
+			[SUBAGENT_PARENT_RUN_ID_ENV]: "parent-run",
+			[SUBAGENT_PARENT_CHILD_INDEX_ENV]: "2",
+			[SUBAGENT_PARENT_DEPTH_ENV]: "1",
+		};
+		const savedEnv = Object.fromEntries(Object.keys(envPatch).map((key) => [key, process.env[key]]));
+		try {
+			Object.assign(process.env, envPatch);
+			const executor = makeExecutor([makeAgent("echo", { model: "openai/gpt-5-mini", thinking: "high" })]);
+
+			const result = await executor.execute(
+				"nested-model-start",
+				{ agent: "echo", task: "Nested task" },
+				new AbortController().signal,
+				undefined,
+				makeMinimalCtx(tempDir),
+			);
+
+			assert.equal(result.isError, undefined);
+			const records = fs.readdirSync(route.eventSink)
+				.sort()
+				.flatMap((name) => parseNestedEventRecords(fs.readFileSync(path.join(route.eventSink, name), "utf-8"), route));
+			const started = records.find((record) => record.type === "subagent.nested.started");
+			assert.equal(started?.child.model, "openai/gpt-5-mini");
+			assert.equal(started?.child.thinking, "high");
+			assert.deepEqual(started?.child.steps, [{ agent: "echo", status: "running", model: "openai/gpt-5-mini", thinking: "high" }]);
+		} finally {
+			for (const [key, value] of Object.entries(savedEnv)) {
+				if (value === undefined) delete process.env[key];
+				else process.env[key] = value;
+			}
+			fs.rmSync(path.dirname(route.eventSink), { recursive: true, force: true });
+		}
+	});
+
+	it("blocks later foreground chain children when hard reported usage is exhausted", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		mockPi.onCall({ output: "first result" });
+		const executor = makeExecutor([makeAgent("echo"), makeAgent("second")]);
+
+		const result = await executor.execute(
+			"foreground-usage-budget",
+			{
+				chain: [
+					{ agent: "echo", task: "First task" },
+					{ agent: "second", task: "Second task" },
+				],
+				usageBudget: { tokens: { hard: 10 } },
+			},
+			new AbortController().signal,
+			undefined,
+			makeMinimalCtx(tempDir),
+		);
+
+		assert.equal(result.isError, true);
+		assert.match(result.content[0]?.text ?? "", /Usage budget exhausted/);
+		assert.equal(mockPi.callCount(), 1);
+		assert.equal(result.details?.usageBudget?.exhausted, true);
+		assert.equal(result.details?.usageBudget?.reason, "tokens");
+	});
+
+	it("blocks queued foreground parallel children when hard reported usage is exhausted", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		mockPi.onCall({ output: "first result" });
+		const executor = makeExecutor([makeAgent("echo"), makeAgent("second")]);
+
+		const result = await executor.execute(
+			"foreground-parallel-usage-budget",
+			{
+				tasks: [
+					{ agent: "echo", task: "First task" },
+					{ agent: "second", task: "Second task" },
+				],
+				concurrency: 1,
+				usageBudget: { tokens: { hard: 10 } },
+			},
+			new AbortController().signal,
+			undefined,
+			makeMinimalCtx(tempDir),
+		);
+
+		assert.equal(result.isError, undefined);
+		assert.equal(mockPi.callCount(), 1);
+		assert.equal(result.details?.results.length, 2);
+		assert.equal(result.details?.results[1]?.skipped, true);
+		assert.match(result.details?.results[1]?.error ?? "", /Usage budget exhausted/);
+		assert.equal(result.details?.usageBudget?.exhausted, true);
+	});
+
 	it("fails implementation runs that complete without mutation attempts", async () => {
 		mockPi.onCall({ output: "Validation:\nlet rawFilename = params.filename.trim();" });
 		const agents = [makeAgent("worker")];
@@ -1146,7 +1595,10 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		);
 
 		assert.equal(result.isError, undefined);
-		assert.deepEqual(result.details?.results?.[0]?.structuredOutput, { ok: true, note: "captured" });
+		const child = result.details?.results?.[0];
+		assert.deepEqual(child?.structuredOutput, { ok: true, note: "captured" });
+		assert.match(child?.finalOutput ?? "", /"ok": true/);
+		if (child?.artifactPaths?.outputPath) assert.match(fs.readFileSync(child.artifactPaths.outputPath, "utf-8"), /"note": "captured"/);
 	});
 
 	it("rejects structured output capture files that were not produced by the structured_output tool", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
@@ -1320,6 +1772,17 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		assert.equal(result.finalOutput, "Applied edit");
 	});
 
+	it("resolves explicit agent aliases to canonical execution names", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		mockPi.onCall({ output: "Implemented" });
+		const executor = makeExecutor([makeAgent("worker", { aliases: ["developer"], completionGuard: false })]);
+
+		const result = await executor.execute("single", { agent: "developer", task: "Implement" }, new AbortController().signal, undefined, makeMinimalCtx(tempDir));
+
+		assert.equal(result.isError, undefined);
+		assert.equal(result.details?.results[0]?.agent, "worker");
+		assert.match(result.content[0]?.text ?? "", /Implemented/);
+	});
+
 	it("returns error for unknown agent", async () => {
 		const agents = makeAgentConfigs(["echo"]);
 		const result = await runSync(tempDir, agents, "nonexistent", "Do something", {});
@@ -1459,8 +1922,8 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		assert.equal(mockPi.callCount(), 1);
 	});
 
-	it("does not retry a signaled child exit", { skip: process.platform === "win32" ? "POSIX child signal reporting is unavailable on Windows" : false }, async () => {
-		mockPi.onCall({ signal: "SIGKILL" });
+	it("does not retry non-SIGKILL signaled child exits", { skip: process.platform === "win32" ? "POSIX child signal reporting is unavailable on Windows" : false }, async () => {
+		mockPi.onCall({ signal: "SIGTERM" });
 		mockPi.onCall({ output: "must not run" });
 		const agents = [makeAgent("worker", { model: "openai/gpt-5-mini" })];
 
@@ -1470,9 +1933,25 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		});
 
 		assert.equal(result.exitCode, 1);
-		assert.equal(result.processSignal, "SIGKILL");
+		assert.equal(result.processSignal, "SIGTERM");
+		assert.equal(result.error, "Subagent process terminated by signal SIGTERM.");
 		assert.equal(result.modelAttempts?.length, 1);
 		assert.equal(mockPi.callCount(), 1);
+	});
+
+	it("prefers signal termination errors over stderr tails", { skip: process.platform === "win32" ? "POSIX child signal reporting is unavailable on Windows" : false }, async () => {
+		mockPi.onCall({ stderr: "INFO benign startup line\n", signal: "SIGTERM" });
+		const agents = [makeAgent("worker", { model: "openai/gpt-5-mini" })];
+
+		const result = await runSync(tempDir, agents, "worker", "Do work", {
+			runId: "signal-error-over-stderr",
+			acceptance: false,
+		});
+
+		assert.equal(result.exitCode, 1);
+		assert.equal(result.processSignal, "SIGTERM");
+		assert.equal(result.error, "Subagent process terminated by signal SIGTERM.");
+		assert.doesNotMatch(result.error ?? "", /INFO benign startup line/);
 	});
 
 	it("does not retry a child exit with raw stdout diagnostics", async () => {
@@ -1574,6 +2053,19 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		const result = await runSync(tempDir, makeAgentConfigs(["echo"]), "echo", "Read fragmented output", { acceptance: false });
 		assert.equal(result.exitCode, 0);
 		assert.equal(getFinalOutput(result.messages), "你好 from fragmented JSON");
+	});
+
+	it("projects an oversized turn_end aggregate without losing the foreground result", async () => {
+		mockPi.onCall({ jsonl: [
+			events.assistantMessage("result before oversized aggregate"),
+			{ type: "turn_end", message: {}, toolResults: [{ content: "x".repeat(MAX_CHILD_PENDING_LINE_BYTES) }] },
+			{ type: "agent_end", willRetry: false },
+			{ type: "agent_settled" },
+		] });
+		const result = await runSync(tempDir, makeAgentConfigs(["echo"]), "echo", "Read parallel images", { acceptance: false });
+		assert.equal(result.exitCode, 0);
+		assert.equal(result.protocolError, undefined);
+		assert.equal(getFinalOutput(result.messages), "result before oversized aggregate");
 	});
 
 	it("fails with protocol_output_limit when a child emits an oversized stdout line", async () => {
@@ -2150,8 +2642,12 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 	});
 
 	it("writes artifacts when configured", async () => {
-		mockPi.onCall({ output: "Result text" });
-		const agents = makeAgentConfigs(["echo"]);
+		mockPi.onCall({
+			output: "Result text",
+			runtimeAcknowledgedExtensions: { version: 1, source: "child-runtime", ids: ["ext.ok"], omitted: 0 },
+		});
+		const privateExtension = path.join(tempDir, "extensions", "private-extension.ts");
+		const agents = [makeAgent("echo", { extensions: [privateExtension] })];
 		const artifactsDir = path.join(tempDir, "artifacts");
 
 		const result = await runSync(tempDir, agents, "echo", "Task", {
@@ -2171,8 +2667,14 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		assert.match(transcript.at(-1)?.text ?? "", /^Result text/);
 		assert.equal(result.transcriptError, undefined);
 		assert.ok(fs.existsSync(artifactsDir), "artifacts dir should exist");
-		const metadata = JSON.parse(fs.readFileSync(result.artifactPaths.metadataPath, "utf-8")) as { launchContractDigest?: string };
+		const metadata = JSON.parse(fs.readFileSync(result.artifactPaths.metadataPath, "utf-8")) as { launchContractDigest?: string; launchResolvedExtensions?: LaunchResolvedExtensions; runtimeAcknowledgedExtensions?: RuntimeAcknowledgedExtensions };
 		assert.equal(metadata.launchContractDigest, result.launchContractDigest);
+		assert.equal(result.launchResolvedExtensions?.source, "launch-resolved");
+		assert.equal(result.launchResolvedExtensions?.disableAmbientExtensions, true);
+		assert.deepEqual(metadata.launchResolvedExtensions, result.launchResolvedExtensions);
+		assert.deepEqual(result.runtimeAcknowledgedExtensions, { version: 1, source: "child-runtime", ids: ["ext.ok"], omitted: 0 });
+		assert.deepEqual(metadata.runtimeAcknowledgedExtensions, result.runtimeAcknowledgedExtensions);
+		assert.ok(!JSON.stringify(result.launchResolvedExtensions).includes(tempDir), "projection should not expose raw extension paths");
 	});
 
 	it("routes foreground artifacts to the configured session directory", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
@@ -2197,6 +2699,30 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		assert.equal(fs.readFileSync(result.details.artifacts.files[0].outputPath, "utf-8"), "session artifact result");
 		assert.equal(fs.existsSync(path.join(tempDir, ".pi-subagents", "artifacts")), false);
 	});
+
+	for (const artifactDir of ["session", "temp"] as const) {
+		it(`keeps foreground chain scratch files out of the project for artifactDir=${artifactDir}`, { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+			mockPi.onCall({ output: `${artifactDir} chain result` });
+			const sessionFile = path.join(tempDir, "sessions", "parent-session", "session.jsonl");
+			const ctx = makeMinimalCtx(tempDir);
+			ctx.sessionManager.getSessionFile = () => sessionFile;
+			const executor = makeExecutor([makeAgent("echo")], { artifactDir });
+
+			const result = await executor.execute(
+				`${artifactDir}-chain-artifact-dir`,
+				{ chain: [{ agent: "echo", task: "Run without project-local scratch files in {chain_dir}" }] },
+				new AbortController().signal,
+				undefined,
+				ctx,
+			);
+
+			const taskArg = readCallArgs().at(-1) ?? "";
+			assert.equal(result.isError, undefined);
+			assert.ok(taskArg.includes(`${CHAIN_RUNS_DIR}${path.sep}`), taskArg);
+			assert.equal(fs.existsSync(path.join(tempDir, ".pi-subagents", "chain-runs")), false);
+			assert.equal(fs.existsSync(path.join(tempDir, ".pi-subagents", "artifacts")), false);
+		});
+	}
 
 	it("writes a failure stub to foreground output artifacts when no output was produced", async () => {
 		mockPi.onCall({ output: "", stderr: "model unavailable", exitCode: 1 });
@@ -2433,7 +2959,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 			{
 				action: "append-step",
 				id: "missing-run",
-				chain: [{ agent: "echo", task: "Review the previous work", acceptance: { level: "reviewed" } }],
+				step: { agent: "echo", task: "Review the previous work", acceptance: { level: "reviewed" } },
 			},
 			new AbortController().signal,
 			undefined,
@@ -2506,6 +3032,39 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 			makeMinimalCtx(tempDir),
 		);
 		assert.equal(agentResult.details?.timeoutMs, 4_000);
+	});
+
+	it("runs omitted async launches in the background when the global default is enabled", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		const executor = makeExecutor([makeAgent("echo")], {}, true);
+
+		const result = await executor.execute(
+			"global-async-default",
+			{ agent: "echo", task: "Task" },
+			new AbortController().signal,
+			undefined,
+			makeMinimalCtx(tempDir),
+		);
+
+		assert.equal(result.isError, undefined);
+		assert.match(result.content[0]?.text ?? "", /Async:/);
+		assert.equal(typeof result.details?.asyncId, "string");
+	});
+
+	it("keeps omitted async launches foreground when the global default is disabled", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		mockPi.onCall({ output: "config foreground default finished" });
+		const executor = makeExecutor([makeAgent("echo")], {}, false);
+
+		const result = await executor.execute(
+			"global-foreground-opt-out",
+			{ agent: "echo", task: "Task" },
+			new AbortController().signal,
+			undefined,
+			makeMinimalCtx(tempDir),
+		);
+
+		assert.equal(result.isError, undefined);
+		assert.match(result.content[0]?.text ?? "", /config foreground default finished/);
+		assert.equal(result.details?.asyncId, undefined);
 	});
 
 	it("applies agent frontmatter defaults to single-agent launches", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
@@ -3042,7 +3601,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		assert.match(result.finalOutput ?? "", /final wrapped output/);
 	});
 
-	it("defers a foreground hard turn limit through active tool work and aborts at the next assistant boundary", async () => {
+	it("preserves a clean foreground completion after turn-budget work defers", async () => {
 		mockPi.onCall({
 			steps: [
 				{
@@ -3092,8 +3651,9 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		assert.equal(duringTool.turnBudgetExceeded, undefined);
 		assert.equal(duringTool.error, undefined);
 		assert.equal(duringTool.status, "running");
-		assert.equal(result.turnBudgetExceeded, true);
-		assert.equal(result.turnBudget?.outcome, "exceeded");
+		assert.equal(result.exitCode, 0);
+		assert.equal(result.turnBudgetExceeded, undefined);
+		assert.equal(result.turnBudget?.outcome, "wrap-up-requested");
 		assert.equal(result.turnBudget?.turnCount, 2);
 		assert.match(result.finalOutput ?? "", /safe assistant boundary reached/);
 		assert.ok(result.messages?.some((message) => message.role === "toolResult" && JSON.stringify(message.content).includes("build completed")));
@@ -3183,6 +3743,464 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		assert.match(result.finalOutput ?? "", /Interrupted/);
 	});
 
+	it("supports synchronous user detach and rejects duplicate and late detach calls", async () => {
+		mockPi.onCall({ steps: [
+			{ delay: 500, jsonl: [events.assistantMessage("completed after user detach")] },
+		] });
+		let detachActive: ((reason?: string) => boolean) | undefined;
+		let detachAccepted = false;
+		let duplicateAccepted = true;
+		let recoveredResult: RunSyncResult | undefined;
+
+		const result = await runSync(tempDir, makeAgentConfigs(["echo"]), "echo", "Keep working", {
+			runId: "user-foreground-detach",
+			acceptance: false,
+			onDetachReady: (detach: (reason?: string) => boolean) => {
+				detachActive = detach;
+				detachAccepted = detach("user request");
+				duplicateAccepted = detach("user request");
+			},
+			onDetachedExit: (postExit) => { recoveredResult = postExit as RunSyncResult; },
+		});
+
+		assert.equal(detachAccepted, true);
+		assert.equal(duplicateAccepted, false);
+		assert.equal(recoveredResult, undefined, "foreground result should return before the child completes");
+		assert.equal(result.exitCode, -2);
+		assert.equal(result.detached, true);
+		assert.equal(result.detachedReason, "user request");
+		assert.equal(result.finalOutput, "Detached at user request before task completion.");
+		assert.equal(result.processSignal, undefined);
+
+		for (let attempt = 0; attempt < 100 && !recoveredResult; attempt++) await new Promise((resolve) => setTimeout(resolve, 20));
+		assert.ok(recoveredResult);
+		assert.equal(recoveredResult.exitCode, 0);
+		assert.equal(recoveredResult.processSignal, undefined);
+		assert.equal(recoveredResult.finalOutput, "completed after user detach");
+		assert.equal(detachActive?.("user request"), false, "detach must reject calls after child exit");
+	});
+
+	it("produces the same authoritative terminal result attached and detached", async () => {
+		mockPi.onCall({ output: "authoritative answer" });
+		mockPi.onCall({ steps: [{ delay: 75, jsonl: [events.assistantMessage("authoritative answer")] }] });
+		const agents = makeAgentConfigs(["echo"]);
+		const attached = await runSync(tempDir, agents, "echo", "Equivalent task", {
+			runId: "attached-authoritative-result",
+			acceptance: false,
+		});
+		let terminal: RunSyncResult | undefined;
+		const receipt = await runSync(tempDir, agents, "echo", "Equivalent task", {
+			runId: "detached-authoritative-result",
+			acceptance: false,
+			onDetachReady: (detach) => assert.equal(detach("user request"), true),
+			onDetachedExit: (result) => { terminal = result as RunSyncResult; },
+		});
+		assert.equal(receipt.detached, true);
+		for (let attempt = 0; attempt < 100 && !terminal; attempt++) await new Promise((resolve) => setTimeout(resolve, 20));
+		assert.ok(terminal);
+		assert.deepEqual(
+			{
+				exitCode: terminal.exitCode,
+				finalOutput: terminal.finalOutput,
+				usage: terminal.usage,
+				progressStatus: terminal.progress.status,
+				acceptanceStatus: terminal.acceptance?.status,
+			},
+			{
+				exitCode: attached.exitCode,
+				finalOutput: attached.finalOutput,
+				usage: attached.usage,
+				progressStatus: attached.progress.status,
+				acceptanceStatus: attached.acceptance?.status,
+			},
+		);
+		assert.equal(terminal.detached, undefined);
+		assert.equal(terminal.detachedReason, "user request");
+	});
+
+	it("isolates every nested detach receipt field from terminal completion and later sanitization", async () => {
+		const receiptReport = [
+			"receipt snapshot",
+			"```acceptance-report",
+			JSON.stringify({
+				criteriaSatisfied: [{ id: "criterion-1", status: "satisfied", evidence: "receipt evidence" }],
+				changedFiles: ["src/receipt.ts"],
+				testsAddedOrUpdated: ["test/receipt.test.ts"],
+				commandsRun: [{ command: "npm test", result: "passed", summary: "passed" }],
+				residualRisks: [],
+				noStagedFiles: true,
+			}),
+			"```",
+		].join("\n");
+		const terminalReport = [
+			"terminal answer",
+			"```acceptance-report",
+			JSON.stringify({
+				criteriaSatisfied: [{ id: "criterion-1", status: "satisfied", evidence: "terminal isolation verified" }],
+				changedFiles: ["src/receipt.ts"],
+				testsAddedOrUpdated: ["test/receipt.test.ts"],
+				commandsRun: [{ command: "npm test", result: "passed", summary: "passed" }],
+				residualRisks: [],
+				noStagedFiles: true,
+			}),
+			"```",
+		].join("\n");
+		mockPi.onCall({ steps: [
+			{ jsonl: [{
+				type: "message_end",
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: receiptReport }],
+					model: "mock/test-model",
+					stopReason: "toolUse",
+					usage: { input: 7, output: 3, cacheRead: 0, cacheWrite: 0, cost: { total: 0.001 } },
+				},
+			}] },
+			{ delay: 300, jsonl: [events.assistantMessage(terminalReport)] },
+		] });
+		let detach: ((reason?: string) => boolean) | undefined;
+		let detached = false;
+		let terminal: RunSyncResult | undefined;
+		const receipt = await runSync(tempDir, makeAgentConfigs(["echo"]), "echo", "Keep the receipt isolated", {
+			runId: "detached-deep-receipt-isolation",
+			agentContract: { version: 1 },
+			acceptance: {
+				level: "checked",
+				criteria: [{
+					id: "criterion-1",
+					must: "Keep detach receipt state isolated",
+					evidence: ["changed-files", "tests-added", "commands-run", "residual-risks", "no-staged-files"],
+				}],
+			},
+			onDetachReady: (detachAttempt) => { detach = detachAttempt; },
+			onUpdate: (update: { content?: Array<{ text?: string }> }) => {
+				if (detached || !update.content?.[0]?.text?.includes("receipt snapshot")) return;
+				detached = detach?.("user request") === true;
+			},
+			onDetachedExit: (result) => { terminal = result as RunSyncResult; },
+		});
+
+		assert.equal(receipt.detached, true);
+		const receiptMessages = receipt.messages as Array<{
+			role?: string;
+			model?: string;
+			content: Array<{ type?: string; text?: string; callerOwned?: boolean }>;
+		}>;
+		const callerOwnedReceiptText = `caller-owned mutation\n${receiptReport}`;
+		(receipt.agentContract as unknown as { version: number }).version = 999;
+		receiptMessages[0]!.model = "caller-owned/model";
+		receiptMessages[0]!.content[0]!.text = callerOwnedReceiptText;
+		receiptMessages[0]!.content[0]!.callerOwned = true;
+		receiptMessages[0]!.content.push({ type: "text", text: "caller-only content" });
+		receiptMessages.push({ role: "assistant", model: "caller-only/model", content: [{ type: "text", text: "caller-only message" }] });
+		const mutableAcceptance = receipt.acceptance as unknown as {
+			status: string;
+			effectiveAcceptance: { level: string; criteria: Array<{ must: string }> };
+			criteria: Array<{ must: string }>;
+		};
+		mutableAcceptance.status = "rejected";
+		mutableAcceptance.effectiveAcceptance.level = "none";
+		mutableAcceptance.effectiveAcceptance.criteria[0]!.must = "caller corrupted effective criterion";
+		mutableAcceptance.criteria[0]!.must = "caller corrupted ledger criterion";
+		receipt.progress.status = "failed";
+		(receipt.progress as unknown as { recentOutput: string[] }).recentOutput.push("caller-only progress");
+		receipt.usage.turns = 999;
+		receipt.usage.input = 999;
+		receipt.attemptedModels = ["caller-only/model"];
+		receipt.modelAttempts = [{ success: false, exitCode: 99, error: "caller-only attempt" }];
+		receipt.effects = { fileMutation: { status: "missing", expected: true, attempted: false, message: "caller-only effect" } };
+		receipt.execution = { status: "failed", success: false, exitCode: 99 };
+		receipt.review = { status: "blockers" };
+
+		for (let attempt = 0; attempt < 100 && !terminal; attempt++) await new Promise((resolve) => setTimeout(resolve, 20));
+		assert.ok(terminal);
+		assert.equal(terminal.exitCode, 0);
+		assert.equal(terminal.finalOutput, "terminal answer");
+		assert.deepEqual(terminal.agentContract, { version: 1 });
+		assert.equal(terminal.acceptance?.status, "checked");
+		assert.equal(terminal.acceptance?.runtimeChecks.every((check) => check.status === "passed"), true);
+		assert.equal(terminal.progress.status, "completed");
+		assert.deepEqual(terminal.usage, { turns: 2, input: 107, output: 53, cacheRead: 0, cacheWrite: 0, cost: 0.002 });
+		assert.deepEqual(terminal.attemptedModels, ["mock/test-model"]);
+		assert.deepEqual(terminal.modelAttempts?.map((attempt) => ({ success: attempt.success, exitCode: attempt.exitCode })), [{ success: true, exitCode: 0 }]);
+		assert.equal(terminal.execution?.status, "completed");
+		assert.equal(terminal.execution?.success, true);
+		assert.equal(terminal.review?.status, "not-requested");
+		assert.deepEqual(terminal.effects, {});
+		assert.doesNotMatch(JSON.stringify(terminal.messages), /acceptance-report/);
+		assert.equal(receiptMessages[0]!.content[0]!.text, callerOwnedReceiptText, "terminal report sanitization must not mutate the caller receipt");
+		assert.equal(receiptMessages[0]!.content[0]!.callerOwned, true);
+		assert.equal(receiptMessages.length, 2);
+	});
+
+	it("keeps the full fallback loop and authoritative aggregation alive after detach", async () => {
+		mockPi.onCall({
+			jsonl: [{
+				type: "message_end",
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "temporary provider failure" }],
+					model: "openai/gpt-5-mini",
+					errorMessage: "rate limit exceeded",
+					usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, cost: { total: 0.01 } },
+				},
+			}],
+			exitCode: 1,
+		});
+		mockPi.onCall({ output: "Recovered on detached fallback" });
+		const agents = [makeAgent("echo", {
+			model: "openai/gpt-5-mini",
+			fallbackModels: ["anthropic/claude-sonnet-4"],
+		})];
+		let terminal: RunSyncResult | undefined;
+
+		const receipt = await runSync(tempDir, agents, "echo", "Task", {
+			runId: "detached-fallback-loop",
+			acceptance: false,
+			onDetachReady: (detach) => assert.equal(detach("user request"), true),
+			onDetachedExit: (result) => { terminal = result as RunSyncResult; },
+		});
+
+		assert.equal(receipt.detached, true);
+		for (let attempt = 0; attempt < 300 && !terminal; attempt++) await new Promise((resolve) => setTimeout(resolve, 20));
+		assert.ok(terminal);
+		assert.equal(terminal.detached, undefined, "terminal status must not remain detached");
+		assert.equal(terminal.detachedReason, "user request");
+		assert.equal(terminal.exitCode, 0);
+		assert.equal(terminal.finalOutput, "Recovered on detached fallback");
+		assert.deepEqual(terminal.attemptedModels, ["openai/gpt-5-mini", "anthropic/claude-sonnet-4"]);
+		assert.deepEqual(terminal.modelAttempts?.map((attempt) => attempt.success), [false, true]);
+		assert.equal(terminal.usage.turns, 2);
+		assert.equal(mockPi.callCount(), 2);
+	});
+
+	it("terminalizes a post-receipt completion pipeline throw exactly once with strict projections", async () => {
+		mockPi.onCall({ steps: [{ delay: 75, jsonl: [events.assistantMessage("answer before callback failure")] }] });
+		let terminal: RunSyncResult | undefined;
+		let callbackCount = 0;
+		const receipt = await runSync(tempDir, makeAgentConfigs(["echo"]), "echo", "Task", {
+			runId: "detached-completion-pipeline-throw",
+			acceptance: { level: "checked", criteria: ["result is checked"] },
+			agentContract: { version: 1 },
+			onDetachReady: (detach) => {
+				assert.equal(detach("user request"), true);
+			},
+			onUpdate: (update: { details?: { progress?: Array<{ status?: string }> } }) => {
+				if (update.details?.progress?.[0]?.status === "completed") throw new Error("terminal consumer update failed");
+			},
+			onDetachedExit: (result) => {
+				callbackCount++;
+				terminal = result as RunSyncResult;
+			},
+		});
+		assert.equal(receipt.detached, true);
+		(receipt.agentContract as unknown as { version: number }).version = 999;
+		receipt.messages.push({ role: "assistant", content: [{ type: "text", text: "caller-only fallback message" }] });
+		const mutableAcceptance = receipt.acceptance as unknown as {
+			status: string;
+			effectiveAcceptance: { level: string; criteria: Array<{ must: string }> };
+		};
+		mutableAcceptance.status = "accepted";
+		mutableAcceptance.effectiveAcceptance.level = "none";
+		mutableAcceptance.effectiveAcceptance.criteria[0]!.must = "caller-only fallback criterion";
+		receipt.progress.status = "completed";
+		receipt.usage.turns = 999;
+		receipt.usage.input = 999;
+		receipt.attemptedModels = ["caller-only/fallback"];
+		receipt.modelAttempts = [{ success: true, exitCode: 0 }];
+		receipt.effects = { fileMutation: { status: "observed", expected: false, attempted: true, message: "caller-only fallback effect" } };
+		for (let attempt = 0; attempt < 100 && !terminal; attempt++) await new Promise((resolve) => setTimeout(resolve, 20));
+		assert.ok(terminal);
+		assert.equal(callbackCount, 1);
+		assert.equal(terminal.exitCode, 1);
+		assert.equal(terminal.detached, undefined);
+		assert.equal(terminal.detachedReason, "user request");
+		assert.equal(terminal.progress?.status, "failed");
+		assert.equal(terminal.acceptance?.status, "rejected");
+		assert.equal(terminal.acceptance?.runtimeChecks?.[0]?.id, "completion-pipeline");
+		assert.equal(terminal.execution?.status, "failed");
+		assert.equal(terminal.execution?.success, false);
+		assert.equal(terminal.review?.status, "not-requested");
+		assert.deepEqual(terminal.agentContract, { version: 1 });
+		assert.deepEqual(terminal.effects, {});
+		assert.equal(terminal.usage.turns, 0);
+		assert.equal(terminal.attemptedModels, undefined);
+		assert.equal(terminal.modelAttempts, undefined);
+		assert.doesNotMatch(JSON.stringify(terminal.messages), /caller-only fallback message/);
+		assert.match(terminal.error ?? "", /Detached completion pipeline failed after receipt/);
+	});
+
+	it("contains a synchronous onDetachReady throw and completes attached", async () => {
+		mockPi.onCall({ output: "completed while attached" });
+		const result = await runSync(tempDir, makeAgentConfigs(["echo"]), "echo", "Task", {
+			runId: "throwing-detach-ready-consumer",
+			acceptance: false,
+			onDetachReady: () => {
+				throw new Error("bad detach consumer");
+			},
+		});
+		assert.equal(result.exitCode, 0);
+		assert.equal(result.detached, undefined);
+		assert.equal(result.finalOutput, "completed while attached");
+		assert.equal(result.progress.recentOutput.some((line) => /Foreground detach callback failed: bad detach consumer/.test(line)), true);
+	});
+
+	it("reports expected artifact post-processing I/O failures without rejecting", async () => {
+		mockPi.onCall({ steps: [
+			{ jsonl: [events.toolStart("read", { path: "README.md" })] },
+			{ delay: 50, jsonl: [events.assistantMessage("artifact answer")] },
+		] });
+		const artifactsDir = path.join(tempDir, "artifact-output-failure");
+		let sabotaged = false;
+		const result = await runSync(tempDir, makeAgentConfigs(["echo"]), "echo", "Task", {
+			runId: "artifact-output-result-field",
+			acceptance: false,
+			artifactsDir,
+			artifactConfig: { enabled: true },
+			onUpdate: (update: { details?: { results?: Array<{ artifactPaths?: { outputPath?: string } }> } }) => {
+				const outputPath = update.details?.results?.[0]?.artifactPaths?.outputPath;
+				if (sabotaged || !outputPath) return;
+				sabotaged = true;
+				fs.mkdirSync(outputPath);
+			},
+		});
+		assert.equal(sabotaged, true);
+		assert.equal(result.exitCode, 0);
+		assert.match(result.outputSaveError ?? "", /Artifact output post-processing failed/);
+	});
+
+	it("publishes detach despite best-effort receipt metadata persistence failure", async () => {
+		mockPi.onCall({ steps: [{ delay: 100, jsonl: [events.assistantMessage("completed after metadata recovery")] }] });
+		const artifactsDir = path.join(tempDir, "receipt-metadata-failure");
+		let terminal: RunSyncResult | undefined;
+		const receipt = await runSync(tempDir, makeAgentConfigs(["echo"]), "echo", "Task", {
+			runId: "detach-receipt-metadata-failure",
+			acceptance: false,
+			artifactsDir,
+			artifactConfig: { enabled: true },
+			onDetachReady: (detach) => {
+				fs.rmSync(artifactsDir, { recursive: true, force: true });
+				fs.writeFileSync(artifactsDir, "block metadata", "utf-8");
+				assert.equal(detach("user request"), true);
+				fs.rmSync(artifactsDir, { force: true });
+				fs.mkdirSync(artifactsDir, { recursive: true });
+			},
+			onDetachedExit: (result) => { terminal = result as RunSyncResult; },
+		});
+		assert.equal(receipt.detached, true);
+		assert.ok(receipt.metadataSaveError, "receipt should record best-effort metadata persistence failure");
+		for (let attempt = 0; attempt < 100 && !terminal; attempt++) await new Promise((resolve) => setTimeout(resolve, 20));
+		assert.equal(terminal?.exitCode, 0);
+	});
+
+	it("contains a throwing detached-exit callback", async () => {
+		mockPi.onCall({ steps: [{ delay: 50, jsonl: [events.assistantMessage("done")] }] });
+		let callbackCount = 0;
+		const receipt = await runSync(tempDir, makeAgentConfigs(["echo"]), "echo", "Task", {
+			runId: "throwing-detached-exit-callback",
+			acceptance: false,
+			onDetachReady: (detach) => assert.equal(detach("user request"), true),
+			onDetachedExit: () => {
+				callbackCount++;
+				throw new Error("consumer callback failed");
+			},
+		});
+		assert.equal(receipt.detached, true);
+		for (let attempt = 0; attempt < 100 && callbackCount === 0; attempt++) await new Promise((resolve) => setTimeout(resolve, 20));
+		assert.equal(callbackCount, 1);
+	});
+
+	it("skips acceptance evaluation when an explicitly interrupted detached result settles", async () => {
+		mockPi.onCall({ steps: [{ delay: 10_000, jsonl: [events.assistantMessage("too late")] }] });
+		const interrupt = new AbortController();
+		let terminal: RunSyncResult | undefined;
+		const receipt = await runSync(tempDir, makeAgentConfigs(["slow"]), "slow", "Task", {
+			runId: "detached-interrupted-acceptance",
+			acceptance: { level: "checked", criteria: ["result is checked"] },
+			interruptSignal: interrupt.signal,
+			onDetachReady: (detach) => {
+				assert.equal(detach("user request"), true);
+				setTimeout(() => interrupt.abort(), 25);
+			},
+			onDetachedExit: (result) => { terminal = result as RunSyncResult; },
+		});
+		assert.equal(receipt.detached, true);
+		for (let attempt = 0; attempt < 100 && !terminal; attempt++) await new Promise((resolve) => setTimeout(resolve, 20));
+		assert.ok(terminal);
+		assert.equal(terminal.interrupted, true);
+		assert.equal(terminal.exitCode, 0);
+		assert.equal(terminal.acceptance?.status, "pending");
+		assert.equal(terminal.acceptance?.runtimeChecks[0]?.status, "not-applicable");
+		assert.equal(terminal.error, undefined);
+	});
+
+	it("linearizes originating abort against detach and keeps explicit interrupt routable afterward", async () => {
+		mockPi.onCall({ steps: [{ delay: 10_000, jsonl: [events.assistantMessage("too late")] }] });
+		const origin = new AbortController();
+		const interrupt = new AbortController();
+		let terminal: RunSyncResult | undefined;
+		const receipt = await runSync(tempDir, makeAgentConfigs(["slow"]), "slow", "Keep working", {
+			runId: "detach-origin-abort-race",
+			acceptance: false,
+			signal: origin.signal,
+			interruptSignal: interrupt.signal,
+			onDetachReady: (detach) => {
+				assert.equal(detach("user request"), true);
+				origin.abort();
+				setTimeout(() => interrupt.abort(), 50);
+			},
+			onDetachedExit: (result) => { terminal = result as RunSyncResult; },
+		});
+
+		assert.equal(receipt.detached, true);
+		for (let attempt = 0; attempt < 100 && !terminal; attempt++) await new Promise((resolve) => setTimeout(resolve, 20));
+		assert.ok(terminal);
+		assert.equal(terminal.interrupted, true, "explicit control interrupt must remain active after detach");
+		assert.equal(terminal.processSignal, "SIGINT");
+		assert.equal(terminal.detached, undefined);
+	});
+
+	it("lets an already-observed originating abort win over detach", async () => {
+		mockPi.onCall({ delay: 10_000 });
+		const origin = new AbortController();
+		let detachAccepted = true;
+		const result = await runSync(tempDir, makeAgentConfigs(["slow"]), "slow", "Abort first", {
+			runId: "origin-abort-wins-detach",
+			signal: origin.signal,
+			onDetachReady: (detach) => {
+				origin.abort();
+				detachAccepted = detach("user request");
+			},
+		});
+		assert.equal(detachAccepted, false);
+		assert.equal(result.detached, undefined);
+	});
+
+	it("keeps the configured runtime timeout active after user detach", async () => {
+		mockPi.onCall({ delay: 10_000 });
+		let recoveredResult: RunSyncResult | undefined;
+		const startedAt = Date.now();
+
+		const result = await runSync(tempDir, makeAgentConfigs(["slow"]), "slow", "Do not run forever", {
+			runId: "user-detach-timeout",
+			timeoutMs: 150,
+			acceptance: false,
+			onDetachReady: (detach: (reason?: string) => boolean) => {
+				assert.equal(detach("user request"), true);
+			},
+			onDetachedExit: (postExit) => { recoveredResult = postExit as RunSyncResult; },
+		});
+
+		assert.equal(result.detached, true);
+		assert.ok(Date.now() - startedAt < 1_000, "detach should release the foreground waiter promptly");
+		for (let attempt = 0; attempt < 300 && !recoveredResult; attempt++) await new Promise((resolve) => setTimeout(resolve, 20));
+		assert.ok(recoveredResult, "configured timeout should terminate and recover the detached child");
+		assert.equal(recoveredResult.timedOut, true);
+		assert.equal(recoveredResult.error, "Subagent timed out after 150ms.");
+		assert.equal(recoveredResult.progress.status, "failed");
+		assert.ok(Date.now() - startedAt < 5_000, "detached child should remain bounded by runtime enforcement");
+	});
+
 	for (const toolName of ["intercom", "contact_supervisor"]) {
 		it(`detaches cleanly on ${toolName} handoff without aborting the child process`, async () => {
 			const eventBus = createEventBus();
@@ -3228,6 +4246,106 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 			assert.equal(accepted, true);
 		});
 	}
+
+	it("reports intercom detach race losses and repeated requests as not accepted", async () => {
+		const abortBus = createEventBus();
+		const abortResponses: boolean[] = [];
+		abortBus.on(INTERCOM_DETACH_RESPONSE_EVENT, (payload) => abortResponses.push((payload as { accepted: boolean }).accepted));
+		mockPi.onCall({ steps: [{ jsonl: [events.toolStart("contact_supervisor", { reason: "need_decision", message: "Need decision" })] }, { delay: 10_000 }] });
+		const origin = new AbortController();
+		let requested = false;
+		const abortedResult = await runSync(tempDir, makeAgentConfigs(["echo"]), "echo", "Task", {
+			runId: "intercom-abort-race-loss",
+			allowIntercomDetach: true,
+			intercomEvents: abortBus,
+			signal: origin.signal,
+			onUpdate: (update) => {
+				if (requested || !update.details?.progress?.some((item) => item.currentTool === "contact_supervisor")) return;
+				requested = true;
+				origin.abort();
+				abortBus.emit(INTERCOM_DETACH_REQUEST_EVENT, { requestId: "abort-race" });
+			},
+		});
+		assert.equal(abortedResult.detached, undefined);
+		assert.deepEqual(abortResponses, [false]);
+
+		const repeatedBus = createEventBus();
+		const repeatedResponses: boolean[] = [];
+		repeatedBus.on(INTERCOM_DETACH_RESPONSE_EVENT, (payload) => repeatedResponses.push((payload as { accepted: boolean }).accepted));
+		mockPi.onCall({ steps: [{ jsonl: [events.toolStart("contact_supervisor", { reason: "need_decision", message: "Need decision" })] }, { delay: 50, jsonl: [events.assistantMessage("done")] }] });
+		let repeated = false;
+		const repeatedReceipt = await runSync(tempDir, makeAgentConfigs(["echo"]), "echo", "Task", {
+			runId: "intercom-repeated-detach",
+			allowIntercomDetach: true,
+			intercomEvents: repeatedBus,
+			onUpdate: (update) => {
+				if (repeated || !update.details?.progress?.some((item) => item.currentTool === "contact_supervisor")) return;
+				repeated = true;
+				repeatedBus.emit(INTERCOM_DETACH_REQUEST_EVENT, { requestId: "first" });
+				repeatedBus.emit(INTERCOM_DETACH_REQUEST_EVENT, { requestId: "second" });
+			},
+		});
+		assert.equal(repeatedReceipt.detached, true);
+		assert.deepEqual(repeatedResponses, [true, false]);
+	});
+
+	it("does not launch retries or fallbacks after intercom detach and keeps timeout enforcement", async () => {
+		const fallbackBus = createEventBus();
+		mockPi.onCall({
+			steps: [{ jsonl: [events.toolStart("contact_supervisor", { reason: "need_decision", message: "Need decision" })] }],
+			stderr: "rate limit exceeded",
+			exitCode: 1,
+		});
+		mockPi.onCall({ output: "must not launch" });
+		let resolveFallbackTerminal!: (result: RunSyncResult) => void;
+		const fallbackTerminal = new Promise<RunSyncResult>((resolve) => { resolveFallbackTerminal = resolve; });
+		let fallbackRequested = false;
+		const receipt = await runSync(tempDir, [makeAgent("echo", { model: "openai/gpt-5-mini", fallbackModels: ["anthropic/claude-sonnet-4"] })], "echo", "Task", {
+			runId: "intercom-no-fallback",
+			acceptance: false,
+			allowIntercomDetach: true,
+			intercomEvents: fallbackBus,
+			onUpdate: (update) => {
+				if (fallbackRequested || !update.details?.progress?.some((item) => item.currentTool === "contact_supervisor")) return;
+				fallbackRequested = true;
+				fallbackBus.emit(INTERCOM_DETACH_REQUEST_EVENT, { requestId: "no-fallback" });
+			},
+			onDetachedExit: (result) => { resolveFallbackTerminal(result as RunSyncResult); },
+		});
+		assert.equal(receipt.detached, true);
+		const fallbackResult = await fallbackTerminal;
+		assert.equal(mockPi.callCount(), 1);
+		assert.equal(fallbackResult.exitCode, 1);
+
+		const timeoutBus = createEventBus();
+		mockPi.reset();
+		mockPi.onCall({ delay: 10_000 });
+		let resolveTimeoutTerminal!: (result: RunSyncResult) => void;
+		const timeoutTerminal = new Promise<RunSyncResult>((resolve) => { resolveTimeoutTerminal = resolve; });
+		let timeoutRequested = false;
+		const timeoutReceipt = await runSync(tempDir, makeAgentConfigs(["slow"]), "slow", "Task", {
+			runId: "intercom-timeout-enforced",
+			acceptance: false,
+			timeoutMs: 125,
+			allowIntercomDetach: true,
+			intercomEvents: timeoutBus,
+			onDetachReady: () => {
+				if (timeoutRequested) return;
+				timeoutRequested = true;
+				timeoutBus.emit(INTERCOM_DETACH_REQUEST_EVENT, {
+					requestId: "timeout",
+					runId: "intercom-timeout-enforced",
+					agent: "slow",
+					childIndex: 0,
+				});
+			},
+			onDetachedExit: (result) => { resolveTimeoutTerminal(result as RunSyncResult); },
+		});
+		assert.equal(timeoutReceipt.detached, true);
+		const timeoutResult = await timeoutTerminal;
+		assert.equal(timeoutResult.timedOut, true);
+		assert.equal(timeoutResult.exitCode, 1);
+	});
 
 	it("enforces the stdout protocol limit after foreground detachment", async () => {
 		const eventBus = createEventBus();

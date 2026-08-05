@@ -114,6 +114,24 @@ export interface DynamicParallelStep {
 	gateOn?: ChainGateLayer;
 }
 
+/** Approval checkpoint: pause before later chain steps until parent approval. */
+export interface CheckpointStep {
+	checkpoint: string;
+	message?: string;
+	phase?: string;
+	label?: string;
+	agent?: string;
+	task?: string;
+	as?: string;
+	output?: string | false;
+	outputMode?: OutputMode;
+	reads?: string[] | false;
+	progress?: boolean;
+	skill?: string | string[] | false;
+	skills?: string[] | false;
+	model?: string;
+}
+
 /** Parallel step: multiple agents running concurrently */
 export interface ParallelStep {
 	parallel: ParallelTaskItem[];
@@ -126,11 +144,15 @@ export interface ParallelStep {
 }
 
 /** Union type for chain steps */
-export type ChainStep = SequentialStep | ParallelStep | DynamicParallelStep;
+export type ChainStep = SequentialStep | ParallelStep | DynamicParallelStep | CheckpointStep;
 
 // =============================================================================
 // Type Guards
 // =============================================================================
+
+export function isCheckpointStep(step: ChainStep): step is CheckpointStep {
+	return "checkpoint" in step;
+}
 
 export function isParallelStep(step: ChainStep): step is ParallelStep {
 	return "parallel" in step && Array.isArray((step as ParallelStep).parallel);
@@ -142,6 +164,9 @@ export function isDynamicParallelStep(step: ChainStep): step is DynamicParallelS
 
 /** Get all agent names in a step (single for sequential, multiple for parallel) */
 export function getStepAgents(step: ChainStep): string[] {
+	if (isCheckpointStep(step)) {
+		return [];
+	}
 	if (isParallelStep(step)) {
 		return step.parallel.map((t) => t.agent);
 	}
@@ -209,6 +234,7 @@ export function resolveChainTemplates(
 	steps: ChainStep[],
 ): ResolvedTemplates {
 	return steps.map((step, i) => {
+		if (isCheckpointStep(step)) return "";
 		if (isParallelStep(step)) {
 			// Parallel step: resolve each task's template
 			return step.parallel.map((task) => {

@@ -128,9 +128,9 @@ describe("registerSubagentNotify", () => {
 			message: {
 				customType: "subagent-notify",
 				content: "Background task completed: **worker**\n\n(no output)",
-				display: true,
+				display: false,
 			},
-			options: { triggerTurn: true },
+			options: { triggerTurn: false },
 		});
 	});
 
@@ -217,9 +217,9 @@ describe("registerSubagentNotify", () => {
 			message: {
 				customType: "subagent-notify",
 				content: `Background task completed: **worker** (2/3)\n\n${summary}`,
-				display: true,
+				display: false,
 			},
-			options: { triggerTurn: true },
+			options: { triggerTurn: false },
 		});
 	});
 
@@ -241,9 +241,9 @@ describe("registerSubagentNotify", () => {
 			message: {
 				customType: "subagent-notify",
 				content: "Background task completed: **worker**\n\nDone\n\nSession file: /tmp/session.jsonl",
-				display: true,
+				display: false,
 			},
-			options: { triggerTurn: true },
+			options: { triggerTurn: false },
 		}]);
 	});
 
@@ -327,7 +327,12 @@ describe("registerSubagentNotify", () => {
 		assert.match(content, /^Background tasks completed \(3\): \*\*alpha\*\*, \*\*beta\*\*, \*\*gamma\*\*/);
 		assert.match(content, /1\. alpha\nalpha done/);
 		assert.match(content, /3\. gamma\ngamma done/);
-		assert.deepEqual(sent[0]!.options, { triggerTurn: true });
+		assert.deepEqual(sent[0]!.message, {
+			customType: "subagent-notify",
+			content,
+			display: false,
+		});
+		assert.deepEqual(sent[0]!.options, { triggerTurn: false });
 	});
 
 	it("ignores successes from other sessions instead of grouping them", () => {
@@ -472,10 +477,24 @@ describe("completion formatting helpers", () => {
 		notifier.dispose();
 	});
 
-	it("buildCompletionDetails derives paused status from state and summary", () => {
+	it("buildCompletionDetails derives paused and stopped statuses", () => {
 		assert.equal(buildCompletionDetails({ id: "x", agent: "w", success: false, state: "paused", summary: "Paused after interrupt.", timestamp: 1 }).status, "paused");
 		assert.equal(buildCompletionDetails({ id: "x", agent: "w", success: false, summary: "boom", exitCode: 1, timestamp: 1 }).status, "failed");
-		assert.equal(buildCompletionDetails({ id: "x", agent: "w", success: true, summary: "ok", exitCode: 0, timestamp: 1 }).status, "completed");
+		assert.equal(buildCompletionDetails({ id: "x", agent: "w", success: false, summary: "terminated", exitCode: 1, processSignal: "SIGTERM", timestamp: 1 }).status, "stopped");
+		assert.equal(buildCompletionDetails({ id: "x", agent: "w", success: false, summary: "terminated", results: [{ success: false, exitCode: 1, processSignal: "SIGTERM" }], timestamp: 1 }).status, "stopped");
+		assert.equal(buildCompletionDetails({ id: "x", agent: "w", success: true, summary: "ok", exitCode: 0, processSignal: "SIGTERM", timestamp: 1 }).status, "completed");
+	});
+
+	it("labels workflow completion and preserves its return/emit/trace preview", () => {
+		const details = buildCompletionDetails({
+			id: "workflow-run",
+			agent: "workflow",
+			success: true,
+			summary: "Workflow completed with 1 child run(s). Return: { answer: 42 } Emitted: ready Trace: 2 event(s).",
+			timestamp: 1,
+		});
+		assert.equal(details.agent, "workflow");
+		assert.match(details.resultPreview, /Return: \{ answer: 42 \}.*Emitted: ready.*Trace: 2 event/);
 	});
 
 	it("buildCompletionDetails falls back to the unknown agent label", () => {

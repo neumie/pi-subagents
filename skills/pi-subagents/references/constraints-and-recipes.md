@@ -17,14 +17,15 @@ This file is a detailed reference loaded from `skills/pi-subagents/SKILL.md`.
   ask wait state at a time.
 - **Keep conversational authority clear.** Advisory subagents should not silently
   become second decision-makers.
+- **Respect the fixed authority policy.** `authorityPolicy` is a small `auto` / `confirm` / `forbid` map for supported operational actions. Worktree discard, destructive cleanup, and spawn-budget grants default to confirmation; stop, steer, and schedule creation remain automatic. Use `worktree.discard` with the durable `handoffPath`; confirm-required actions refuse safely without an interactive UI and retained paths include manual Git recovery commands.
 
-Runtime config can change orchestration behavior. `intercomBridge.resultDelivery: false` disables only external acknowledged grouped-result delivery when native parent notifications own completion; supervisor asks/progress stay active, and enabled transport failures are still reported. `asyncByDefault` and `forceTopLevelAsync` affect whether launches detach; `waitTool` can make direct `subagent_wait()` calls return immediately while headless auto-drain remains active, and its effective value is propagated to child runtimes; `globalConcurrencyLimit` bounds concurrent fanout, while a positive `maxSubagentSpawnsPerSession` optionally caps cumulative launches (`0` or unset is unlimited). Status and doctor report the budget; static work preflights declared capacity; only the settled root interactive parent can use `grant-spawn-budget` after native confirmation, with total grants bounded by the original cap. Compaction does not reset usage or grants; `singleRunOutputBaseDir` and `worktreeBaseDir` route outputs and worktrees; `completionBatch` groups async notifications. `artifactDir` is `project` (default), `session`, or `temp` and chooses where subagent artifacts are stored. Set `asyncWidget: false` to hide the above-editor background-run widget when a companion footer or dashboard owns that space (fleet inspector remains available). Per-run `artifacts: false` disables artifact capture for that launch. Async status and result artifacts are versioned with fields such as `lifecycleArtifactVersion`, `workflowGraph`, `steps`, `results`, `totalTokens`, `totalCost`, `turnCount`, `toolCount`, and nested `children`. Child protocol failures expose a structured `protocolError`; `protocol_output_limit` means a child emitted a JSONL line above the 4 MiB live-parser cap. Prefer these artifacts and `status` views over scraping terminal output.
+Runtime config can change orchestration behavior. `intercomBridge.resultDelivery: false` disables only external acknowledged grouped-result delivery when native parent notifications own completion; supervisor asks/progress stay active, and enabled transport failures are still reported. `asyncByDefault` and `forceTopLevelAsync` affect whether launches detach; `waitTool` can make direct `subagent_wait()` calls return immediately while headless auto-drain remains active, and its effective value is propagated to child runtimes; `globalConcurrencyLimit` bounds concurrent fanout, while a positive `maxSubagentSpawnsPerSession` optionally caps cumulative launches (`0` or unset is unlimited). Status and doctor report the budget; static work preflights declared capacity; only the settled root interactive parent can use `grant-spawn-budget` after native confirmation, with total grants bounded by the original cap. Compaction does not reset usage or grants; `singleRunOutputBaseDir` and `worktreeBaseDir` route outputs and worktrees; `completionBatch` groups async notifications. `artifactDir` is `project` (default), `session`, or `temp` and chooses where subagent artifacts are stored. Set `asyncWidget: false` to hide the above-editor background-run widget when a companion footer or dashboard owns that space (fleet inspector remains available). Per-run `artifacts: false` disables artifact capture for that launch. Async status and result artifacts include `lifecycleArtifactVersion` and fields such as `workflowGraph`, `steps`, `results`, `totalTokens`, `totalCost`, `turnCount`, `toolCount`, and nested `children`. Child protocol failures expose a structured `protocolError`; `protocol_output_limit` means a child emitted a JSONL line above the 4 MiB live-parser cap. Prefer these artifacts and `status` views over scraping terminal output.
 
 ## Best Practices
 
 ### Prefer async orchestration
 
-Launch every subagent asynchronously by default. Use `async: true` for scouts, researchers, workers, reviewers, validators, oracle checks, one-off delegates, chains, and parallel groups unless you intentionally need a foreground/blocking run. The parent should keep moving: inspect code while scouts run, prepare validation while a worker implements, do a local diff pass while reviewers review, and synthesize or verify while a fix worker applies accepted feedback. Async is the default orchestration posture; foreground runs are the explicit opt-out.
+Launch every subagent asynchronously by default. Use `async: true` for scouts, researchers, workers, reviewers, validators, oracle checks, one-off delegates, and scripted workflows unless you intentionally need a foreground/blocking run. When two or more child lanes, monitors, or dependent steps should move together, launch them as one `workflowScript` with stable keys instead of separate tool calls. Use direct single-child launches only for truly isolated work. The parent should keep moving: inspect code while scouts run, prepare validation while a worker implements, do a local diff pass while reviewers review, and synthesize or verify while a fix worker applies accepted feedback. Async is the default orchestration posture; foreground runs are the explicit opt-out.
 
 ### Use subagent_wait() to block until async runs finish
 
@@ -35,7 +36,7 @@ In an interactive chat, do not call `subagent_wait()` merely to wait after launc
 - `subagent_wait({ id: "..." })` — block on one async or remembered detached foreground run (id or prefix). Provider items are not selected through this parameter.
 - `subagent_wait({ timeoutMs })` — cap the block; active work keeps running if it elapses.
 
-Providers are discovered through the versioned `pi-subagents/background-work` registry and must return stable item IDs with exact owning session IDs. Child agents receive no provider automatically: keep `subagent_wait` in the child `tools` allowlist and load provider extensions through `extensions` or `subagentOnlyExtensions`.
+Providers are discovered through the `pi-subagents/background-work` registry and must return stable item IDs with exact owning session IDs. Child agents receive no provider automatically: keep `subagent_wait` in the child `tools` allowlist and load provider extensions through `extensions` or `subagentOnlyExtensions`.
 
 For non-interactive fleet orchestration, `subagent_wait()` can keep N workers in flight: launch N, wait for the next completion, react to the result, launch a replacement if needed, then wait again. Use `subagent_wait({ all: true })` only when you intentionally want to drain the fleet to zero. If the turn ends first, headless `agent_end` auto-drain still waits for exact current-session work. In an interactive session, return to the user instead of holding the turn open just to await completion.
 
@@ -75,14 +76,12 @@ Use `/name` so intercom targeting stays stable.
 
 ### Recon → Plan → Implement
 
-```typescript
-subagent({
-  chain: [
-    { agent: "scout", task: "Map the auth flow and summarize relevant files" },
-    { agent: "planner", task: "Plan the migration from {previous}" },
-    { agent: "worker", task: "Implement the approved plan from {previous}" }
-  ]
-})
+```js
+subagent({ workflowScript: `
+  const context = await runs.run("recon", { agent: "scout", task: "Inspect the codebase and identify the implementation seam" });
+  const plan = await runs.run("plan", { agent: "planner", task: "Plan from: " + context.output });
+  return (await runs.run("implement", { agent: "worker", task: "Implement this approved plan: " + plan.output })).output;
+` })
 ```
 
 ### Fable mode for complex work
@@ -111,7 +110,7 @@ When the user approves launching a subagent to carry out a plan or workflow, tre
 - `/parallel-review` maps to: launch fresh-context `reviewer` agents with distinct review angles; synthesize the feedback before applying anything.
 - `/review-loop` maps to: keep the parent in charge of worker → fresh reviewers → synthesized fix worker cycles until no fixes worth doing now remain, an unapproved decision appears, or the review-round cap is reached.
 - `/parallel-research` maps to: combine local `scout` context with external `researcher` evidence when current docs, ecosystem behavior, or API details matter.
-- `/parallel-context-build` maps to: run a chain-mode parallel group of `context-builder` agents with distinct temp output paths, then synthesize their context and meta-prompt sections.
+- `/parallel-context-build` maps to: use `workflowScript` with `runs.all` for distinct `context-builder` lanes, then synthesize their context and meta-prompt sections.
 - `/parallel-handoff-plan` maps to: run external `researcher` plus local/strategy `context-builder` passes, then a synthesis `context-builder` that writes an implementation handoff plan and implementation-ready meta-prompt.
 - `/parallel-cleanup` maps to: use review-only cleanup passes after implementation, especially for simplicity, verbosity, and redundant tests.
 
@@ -194,22 +193,16 @@ For explicit review-loop requests, repeat worker → fresh-reviewer → synthesi
 
 ### Parallel non-conflicting analysis
 
-```typescript
-subagent({
-  tasks: [
-    { agent: "scout", task: "Audit frontend auth flow" },
-    { agent: "researcher", task: "Research current retry/backoff best practices" }
-  ]
-})
+```js
+subagent({ workflowScript: `
+  return await runs.all([
+    { key: "frontend", agent: "scout", task: "Inspect the frontend" },
+    { key: "backend", agent: "scout", task: "Inspect the backend" }
+  ]);
+` })
 ```
 
-### Saved chain
-
-```text
-/run-chain review-chain -- review this branch
-```
-
-Use saved `.chain.md` or `.chain.json` workflows when the user wants a repeatable multi-agent flow without rewriting the chain each time. Prefer `.chain.json` for dynamic fanout or inline `outputSchema` objects; `.chain.md` remains the simple sequential/static authoring format.
+Use distinct keys, prompts, and output paths. Do not launch parallel writers into the same checkout.
 
 ## Error Handling
 

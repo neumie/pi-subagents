@@ -8,7 +8,7 @@ import { parse as parseYaml } from "yaml";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import type { AcceptanceInput, AcceptanceRole, OutputMode, ToolBudgetConfig, TurnBudgetConfig } from "../shared/types.ts";
+import type { AcceptanceInput, AcceptanceRole, AgentRunnerConfig, OutputMode, ToolBudgetConfig, TurnBudgetConfig } from "../shared/types.ts";
 import { getAgentDir, getProjectConfigDir } from "../shared/utils.ts";
 import { KNOWN_FIELDS } from "./agent-serializer.ts";
 import { parseChain, parseJsonChain } from "./chain-serializer.ts";
@@ -20,6 +20,7 @@ export { buildRuntimeName, frontmatterNameForConfig, parsePackageName } from "./
 import { parseMemoryFrontmatter } from "./agent-memory.ts";
 import { resolveTurnBudgetConfig } from "../runs/shared/turn-budget.ts";
 import { validateAcceptanceInput } from "../runs/shared/acceptance.ts";
+import { validatePermissionRules, type PermissionRules } from "../runs/shared/permissions.ts";
 
 export type AgentScope = "user" | "project" | "both";
 
@@ -59,6 +60,7 @@ export function defaultInheritSkills(): boolean {
 }
 
 export interface BuiltinAgentOverrideBase {
+	description?: string;
 	model?: string;
 	fallbackModels?: string[];
 	thinking?: string | false;
@@ -80,6 +82,7 @@ export interface BuiltinAgentOverrideBase {
 }
 
 interface BuiltinAgentOverrideConfig {
+	description?: string;
 	model?: string | false;
 	fallbackModels?: string[] | false;
 	thinking?: string | false;
@@ -113,9 +116,11 @@ export interface AgentModelSourceInfo {
 
 export interface AgentConfig {
 	name: string;
+	runner?: AgentRunnerConfig;
 	localName?: string;
 	packageName?: string;
 	description: string;
+	aliases?: string[];
 	tools?: string[];
 	mcpDirectTools?: string[];
 	model?: string;
@@ -145,12 +150,15 @@ export interface AgentConfig {
 	maxSubagentDepth?: number;
 	completionGuard?: boolean;
 	toolBudget?: ToolBudgetConfig;
+	permissions?: PermissionRules;
 	memory?: AgentMemoryConfig;
 	disabled?: boolean;
 	extraFields?: Record<string, string>;
 	override?: BuiltinAgentOverrideInfo;
 	modelSource?: AgentModelSourceInfo;
 }
+
+type ProjectRootResolution = "nearest" | "git-root";
 
 interface SubagentSettings {
 	overrides: Record<string, BuiltinAgentOverrideConfig>;
@@ -322,6 +330,21 @@ function getGlobalNpmRoot(): string | null {
 	const offline = process.env.PI_OFFLINE?.toLowerCase();
 	if (offline === "1" || offline === "true" || offline === "yes") return null;
 	if (cachedGlobalNpmRoot !== null) return cachedGlobalNpmRoot;
+
+	const windowsGlobalRoot = process.platform === "win32" && process.env.APPDATA
+		? path.join(process.env.APPDATA, "npm", "node_modules")
+		: undefined;
+	if (windowsGlobalRoot) {
+		try {
+			if (fs.statSync(windowsGlobalRoot).isDirectory()) {
+				cachedGlobalNpmRoot = fs.realpathSync(windowsGlobalRoot);
+				return cachedGlobalNpmRoot;
+			}
+		} catch {
+			// Fall through if the directory disappears while resolving it.
+		}
+	}
+
 	try {
 		cachedGlobalNpmRoot = fs.realpathSync(execSync("npm root -g", { encoding: "utf-8", timeout: 5000 }).trim());
 		return cachedGlobalNpmRoot;
@@ -422,7 +445,7 @@ function collectSettingsPackageRoots(settingsFile: string, baseDir: string): str
 
 function collectPackageSubagentPaths(cwd: string, options: { includeUser: boolean; includeProject: boolean } = { includeUser: true, includeProject: true }): PackageSubagentPaths {
 	const agentDir = getAgentDir();
-	const projectRoot = findNearestProjectRoot(cwd) ?? cwd;
+	const projectRoot = findConfiguredProjectRoot(cwd) ?? cwd;
 	const packageRoots = [
 		projectRoot,
 	];
@@ -471,6 +494,42 @@ function collectPackageSubagentPaths(cwd: string, options: { includeUser: boolea
 	return { agents, chains };
 }
 
+function normalizeAgentAliases(rawAliases: string[] | undefined, agentName: string): string[] | undefined {
+	const aliases = [...new Set((rawAliases ?? []).map((alias) => alias.trim()).filter(Boolean))]
+		.filter((alias) => alias !== agentName);
+	return aliases.length > 0 ? aliases : undefined;
+}
+
+function effectiveAgentMatch(matches: AgentConfig[]): { agent?: AgentConfig; error?: string } {
+	const distinctNames = [...new Set(matches.map((agent) => agent.name))];
+	if (distinctNames.length === 1) {
+		const sourceRank = new Map<AgentConfig["source"], number>([["builtin", 0], ["package", 1], ["user", 2], ["project", 3]]);
+		const agent = [...matches].sort((a, b) => (sourceRank.get(b.source) ?? 0) - (sourceRank.get(a.source) ?? 0))[0];
+		return agent ? { agent } : {};
+	}
+	return {};
+}
+
+export function resolveAgentName(name: string, agents: AgentConfig[]): { agent?: AgentConfig; error?: string } {
+	const raw = name.trim();
+	const exact = agents.filter((agent) => agent.name === raw || agent.localName === raw);
+	if (exact.length === 1) return exact[0] ? { agent: exact[0] } : {};
+	if (exact.length > 1) {
+		const effective = effectiveAgentMatch(exact);
+		if (effective.agent) return effective;
+		return { error: `Ambiguous agent name '${name}': ${exact.map((agent) => agent.name).join(", ")}` };
+	}
+
+	const aliases = agents.filter((agent) => agent.aliases?.includes(raw));
+	if (aliases.length === 1) return aliases[0] ? { agent: aliases[0] } : {};
+	if (aliases.length > 1) {
+		const effective = effectiveAgentMatch(aliases);
+		if (effective.agent) return effective;
+		return { error: `Ambiguous agent alias '${name}': ${aliases.map((agent) => agent.name).join(", ")}` };
+	}
+	return {};
+}
+
 function splitToolList(rawTools: string[] | undefined): { tools?: string[]; mcpDirectTools?: string[] } {
 	const mcpDirectTools: string[] = [];
 	const tools: string[] = [];
@@ -507,29 +566,31 @@ function arraysEqual(a: string[] | undefined, b: string[] | undefined): boolean 
 
 function cloneOverrideBase(agent: AgentConfig): BuiltinAgentOverrideBase {
 	return {
-		model: agent.model,
-		fallbackModels: agent.fallbackModels ? [...agent.fallbackModels] : undefined,
-		thinking: agent.thinking,
+		description: agent.description,
+		...(agent.model !== undefined ? { model: agent.model } : {}),
+		...(agent.fallbackModels ? { fallbackModels: [...agent.fallbackModels] } : {}),
+		...(agent.thinking !== undefined ? { thinking: agent.thinking } : {}),
 		systemPromptMode: agent.systemPromptMode,
 		inheritProjectContext: agent.inheritProjectContext,
 		inheritSkills: agent.inheritSkills,
-		defaultContext: agent.defaultContext,
-		acceptanceRole: agent.acceptanceRole,
-		disabled: agent.disabled,
+		...(agent.defaultContext !== undefined ? { defaultContext: agent.defaultContext } : {}),
+		...(agent.acceptanceRole !== undefined ? { acceptanceRole: agent.acceptanceRole } : {}),
+		...(agent.disabled !== undefined ? { disabled: agent.disabled } : {}),
 		systemPrompt: agent.systemPrompt,
-		skills: agent.skills ? [...agent.skills] : undefined,
-		skillPath: agent.skillPath ? [...agent.skillPath] : undefined,
-		tools: agent.tools ? [...agent.tools] : undefined,
-		mcpDirectTools: agent.mcpDirectTools ? [...agent.mcpDirectTools] : undefined,
-		extensions: agent.extensionsFromDefault ? undefined : agent.extensions ? [...agent.extensions] : undefined,
-		subagentOnlyExtensions: agent.subagentOnlyExtensions ? [...agent.subagentOnlyExtensions] : undefined,
-		completionGuard: agent.completionGuard,
-		toolBudget: agent.toolBudget,
+		...(agent.skills ? { skills: [...agent.skills] } : {}),
+		...(agent.skillPath ? { skillPath: [...agent.skillPath] } : {}),
+		...(agent.tools ? { tools: [...agent.tools] } : {}),
+		...(agent.mcpDirectTools ? { mcpDirectTools: [...agent.mcpDirectTools] } : {}),
+		...(!agent.extensionsFromDefault && agent.extensions ? { extensions: [...agent.extensions] } : {}),
+		...(agent.subagentOnlyExtensions ? { subagentOnlyExtensions: [...agent.subagentOnlyExtensions] } : {}),
+		...(agent.completionGuard !== undefined ? { completionGuard: agent.completionGuard } : {}),
+		...(agent.toolBudget !== undefined ? { toolBudget: agent.toolBudget } : {}),
 	};
 }
 
 function cloneOverrideValue(override: BuiltinAgentOverrideConfig): BuiltinAgentOverrideConfig {
 	return {
+		...(override.description !== undefined ? { description: override.description } : {}),
 		...(override.model !== undefined ? { model: override.model } : {}),
 		...(override.fallbackModels !== undefined
 			? { fallbackModels: override.fallbackModels === false ? false : [...override.fallbackModels] }
@@ -551,12 +612,26 @@ function cloneOverrideValue(override: BuiltinAgentOverrideConfig): BuiltinAgentO
 	};
 }
 
-export function findNearestProjectRoot(cwd: string): string | null {
+function isProjectRootCandidate(dir: string): boolean {
+	return isDirectory(getProjectConfigDir(dir)) || isDirectory(path.join(dir, ".agents"));
+}
+
+function findProjectRootCandidates(cwd: string): string[] {
+	const roots: string[] = [];
 	let currentDir = cwd;
 	while (true) {
-		if (isDirectory(getProjectConfigDir(currentDir)) || isDirectory(path.join(currentDir, ".agents"))) {
-			return currentDir;
-		}
+		if (isProjectRootCandidate(currentDir)) roots.push(currentDir);
+
+		const parentDir = path.dirname(currentDir);
+		if (parentDir === currentDir) return roots;
+		currentDir = parentDir;
+	}
+}
+
+function findNearestGitRoot(cwd: string): string | null {
+	let currentDir = cwd;
+	while (true) {
+		if (fs.existsSync(path.join(currentDir, ".git"))) return currentDir;
 
 		const parentDir = path.dirname(currentDir);
 		if (parentDir === currentDir) return null;
@@ -564,12 +639,46 @@ export function findNearestProjectRoot(cwd: string): string | null {
 	}
 }
 
+function readProjectRootResolution(projectRoot: string): ProjectRootResolution | undefined {
+	const settingsPath = path.join(getProjectConfigDir(projectRoot), "settings.json");
+	if (!fs.existsSync(settingsPath)) return undefined;
+	const settings = readSettingsFileStrict(settingsPath);
+	const subagents = settings.subagents;
+	if (!subagents || typeof subagents !== "object" || Array.isArray(subagents)) return undefined;
+
+	const value = (subagents as Record<string, unknown>).projectRootResolution;
+	if (value === undefined) return undefined;
+	if (value === "nearest" || value === "git-root") return value;
+	throw new Error(`Subagent settings in '${settingsPath}' have invalid 'projectRootResolution'; expected 'nearest' or 'git-root'.`);
+}
+
+export function findNearestProjectRoot(cwd: string): string | null {
+	return findProjectRootCandidates(cwd)[0] ?? null;
+}
+
+function findConfiguredProjectRoot(cwd: string): string | null {
+	const candidates = findProjectRootCandidates(cwd);
+	const nearestRoot = candidates[0];
+	if (!nearestRoot) return null;
+
+	const nearestMode = readProjectRootResolution(nearestRoot);
+	if (nearestMode === "nearest") return nearestRoot;
+
+	const gitRoot = findNearestGitRoot(cwd);
+	const gitProjectRoot = gitRoot ? candidates.find((candidate) => path.resolve(candidate) === path.resolve(gitRoot)) : undefined;
+	if (gitProjectRoot && (nearestMode === "git-root" || readProjectRootResolution(gitProjectRoot) === "git-root")) {
+		return gitProjectRoot;
+	}
+
+	return nearestRoot;
+}
+
 function getUserAgentSettingsPath(): string {
 	return path.join(getAgentDir(), "settings.json");
 }
 
 function getProjectAgentSettingsPath(cwd: string): string | null {
-	const projectRoot = findNearestProjectRoot(cwd);
+	const projectRoot = findConfiguredProjectRoot(cwd);
 	return projectRoot ? path.join(getProjectConfigDir(projectRoot), "settings.json") : null;
 }
 
@@ -633,6 +742,14 @@ function parseBuiltinOverrideEntry(
 
 	const input = value as Record<string, unknown>;
 	const override: BuiltinAgentOverrideConfig = {};
+
+	if ("description" in input) {
+		if (typeof input.description === "string" && input.description.trim()) {
+			override.description = input.description.trim();
+		} else {
+			throw new Error(`Builtin override '${name}' in '${filePath}' has invalid 'description'; expected a non-empty string.`);
+		}
+	}
 
 	if ("model" in input) {
 		if (typeof input.model === "string" || input.model === false) override.model = input.model;
@@ -784,14 +901,23 @@ function readSubagentSettings(filePath: string | null): SubagentSettings {
 
 	const parsed: Record<string, BuiltinAgentOverrideConfig> = {};
 	const agentOverrides = subagentsObject.agentOverrides;
+	const parsedSettings: SubagentSettings = {
+		overrides: parsed,
+		...(defaultModel !== undefined ? { defaultModel } : {}),
+		...(defaultThinking !== undefined ? { defaultThinking } : {}),
+		...(defaultExtensions !== undefined ? { defaultExtensions } : {}),
+		...(disableBuiltins !== undefined ? { disableBuiltins } : {}),
+		...(disableThinking !== undefined ? { disableThinking } : {}),
+		...(modelScope !== undefined ? { modelScope } : {}),
+	};
 	if (!agentOverrides || typeof agentOverrides !== "object" || Array.isArray(agentOverrides)) {
-		return { overrides: parsed, defaultModel, defaultThinking, defaultExtensions, disableBuiltins, disableThinking, modelScope };
+		return parsedSettings;
 	}
 	for (const [name, value] of Object.entries(agentOverrides)) {
 		const override = parseBuiltinOverrideEntry(name, value, filePath);
 		if (override) parsed[name] = override;
 	}
-	return { overrides: parsed, defaultModel, defaultThinking, defaultExtensions, disableBuiltins, disableThinking, modelScope };
+	return parsedSettings;
 }
 
 function resolveSubagentDefaultModel(
@@ -881,41 +1007,35 @@ function applyBuiltinOverride(
 		override: { ...meta, base: cloneOverrideBase(agent) },
 	};
 
-	if (override.model !== undefined) next.model = override.model === false ? undefined : override.model;
-	if (override.fallbackModels !== undefined) {
-		next.fallbackModels = override.fallbackModels === false ? undefined : [...override.fallbackModels];
-	}
-	if (override.thinking !== undefined) next.thinking = override.thinking === false ? undefined : override.thinking;
+	if (override.description !== undefined) next.description = override.description;
+	if (override.model !== undefined) { if (override.model === false) delete next.model; else next.model = override.model; }
+	if (override.fallbackModels !== undefined) { if (override.fallbackModels === false) delete next.fallbackModels; else next.fallbackModels = [...override.fallbackModels]; }
+	if (override.thinking !== undefined) { if (override.thinking === false) delete next.thinking; else next.thinking = override.thinking; }
 	if (override.systemPromptMode !== undefined) next.systemPromptMode = override.systemPromptMode;
 	if (override.inheritProjectContext !== undefined) next.inheritProjectContext = override.inheritProjectContext;
 	if (override.inheritSkills !== undefined) next.inheritSkills = override.inheritSkills;
-	if (override.defaultContext !== undefined) next.defaultContext = override.defaultContext === false ? undefined : override.defaultContext;
-	if (override.acceptanceRole !== undefined) next.acceptanceRole = override.acceptanceRole === false ? undefined : override.acceptanceRole;
+	if (override.defaultContext !== undefined) { if (override.defaultContext === false) delete next.defaultContext; else next.defaultContext = override.defaultContext; }
+	if (override.acceptanceRole !== undefined) { if (override.acceptanceRole === false) delete next.acceptanceRole; else next.acceptanceRole = override.acceptanceRole; }
 	if (override.disabled !== undefined) next.disabled = override.disabled;
 	if (override.systemPrompt !== undefined) next.systemPrompt = override.systemPrompt;
-	if (override.skills !== undefined) next.skills = override.skills === false ? undefined : [...override.skills];
+	if (override.skills !== undefined) { if (override.skills === false) delete next.skills; else next.skills = [...override.skills]; }
 	if (override.tools !== undefined) {
 		const { tools, mcpDirectTools } = splitToolList(override.tools === false ? [] : override.tools);
-		next.tools = tools;
-		next.mcpDirectTools = mcpDirectTools;
+		if (tools === undefined) delete next.tools; else next.tools = tools;
+		if (mcpDirectTools === undefined) delete next.mcpDirectTools; else next.mcpDirectTools = mcpDirectTools;
 	}
-	if (override.extensions !== undefined) next.extensions = override.extensions === false ? undefined : [...override.extensions];
-	if (override.subagentOnlyExtensions !== undefined) {
-		next.subagentOnlyExtensions = override.subagentOnlyExtensions === false ? undefined : [...override.subagentOnlyExtensions];
-	}
+	if (override.extensions !== undefined) { if (override.extensions === false) delete next.extensions; else next.extensions = [...override.extensions]; }
+	if (override.subagentOnlyExtensions !== undefined) { if (override.subagentOnlyExtensions === false) delete next.subagentOnlyExtensions; else next.subagentOnlyExtensions = [...override.subagentOnlyExtensions]; }
 	if (override.completionGuard !== undefined) next.completionGuard = override.completionGuard;
-	if (override.toolBudget !== undefined) next.toolBudget = override.toolBudget === false ? undefined : override.toolBudget;
+	if (override.toolBudget !== undefined) { if (override.toolBudget === false) delete next.toolBudget; else next.toolBudget = override.toolBudget; }
 
 	return next;
 }
 
 function clearBuiltinThinking(agent: AgentConfig, meta: { scope: "user" | "project"; path: string }): AgentConfig {
 	if (agent.thinking === undefined) return agent;
-	return {
-		...agent,
-		thinking: undefined,
-		override: agent.override ?? { ...meta, base: cloneOverrideBase(agent) },
-	};
+	const { thinking: _thinking, ...next } = agent;
+	return { ...next, override: agent.override ?? { ...meta, base: cloneOverrideBase(agent) } };
 }
 
 function applyBuiltinOverrides(
@@ -997,10 +1117,15 @@ function applyCustomAgentOverride(
 		value: AgentConfig[K],
 	): void => {
 		if (agentHasFrontmatterField(agent, ...frontmatterFields)) return;
-		mutable()[field] = value;
+		const target = mutable();
+		if (value === undefined) delete target[field]; else target[field] = value;
 		anyFilled = true;
 	};
 
+	if (override.description !== undefined) {
+		mutable().description = override.description;
+		anyFilled = true;
+	}
 	if (override.model !== undefined) {
 		fill("model", ["model"], override.model === false ? undefined : override.model);
 	}
@@ -1039,8 +1164,8 @@ function applyCustomAgentOverride(
 	if (override.tools !== undefined && !agentHasFrontmatterField(agent, "tools")) {
 		const { tools, mcpDirectTools } = splitToolList(override.tools === false ? [] : override.tools);
 		const target = mutable();
-		target.tools = tools;
-		target.mcpDirectTools = mcpDirectTools;
+		if (tools === undefined) delete target.tools; else target.tools = tools;
+		if (mcpDirectTools === undefined) delete target.mcpDirectTools; else target.mcpDirectTools = mcpDirectTools;
 		anyFilled = true;
 	}
 	if (override.extensions !== undefined) {
@@ -1091,10 +1216,14 @@ function applyCustomAgentOverrides(
 
 export function buildBuiltinOverrideConfig(
 	base: BuiltinAgentOverrideBase,
-	draft: Pick<AgentConfig, "model" | "fallbackModels" | "thinking" | "systemPromptMode" | "inheritProjectContext" | "inheritSkills" | "defaultContext" | "acceptanceRole" | "disabled" | "systemPrompt" | "skills" | "tools" | "mcpDirectTools" | "extensions" | "subagentOnlyExtensions" | "completionGuard" | "toolBudget">,
+	draft: Pick<AgentConfig, "model" | "fallbackModels" | "thinking" | "systemPromptMode" | "inheritProjectContext" | "inheritSkills" | "defaultContext" | "acceptanceRole" | "disabled" | "systemPrompt" | "skills" | "tools" | "mcpDirectTools" | "extensions" | "subagentOnlyExtensions" | "completionGuard" | "toolBudget"> & Partial<Pick<AgentConfig, "description">>,
 ): BuiltinAgentOverrideConfig | undefined {
 	const override: BuiltinAgentOverrideConfig = {};
 
+	if (draft.description !== undefined) {
+		const description = draft.description.trim();
+		if (description && description !== base.description) override.description = description;
+	}
 	if (draft.model !== base.model) override.model = draft.model ?? false;
 	if (!arraysEqual(draft.fallbackModels, base.fallbackModels)) override.fallbackModels = draft.fallbackModels ? [...draft.fallbackModels] : false;
 	if (draft.thinking !== base.thinking) override.thinking = draft.thinking ?? false;
@@ -1290,6 +1419,55 @@ function isLegacyAgentSkillPath(rootDir: string, filePath: string): boolean {
 	return parts.some((part, index) => part === ".agents" && parts[index + 1] === "skills");
 }
 
+function parseAgentRunnerFrontmatter(raw: string | undefined, agentName: string): AgentRunnerConfig | undefined {
+	if (raw === undefined || !raw.trim()) return undefined;
+	let parsed: unknown;
+	try {
+		parsed = parseYaml(raw);
+	} catch (error) {
+		throw new Error(`Agent '${agentName}' has invalid runner frontmatter: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
+	}
+	if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+		throw new Error(`Agent '${agentName}' has invalid runner frontmatter; expected an object.`);
+	}
+	const runner = parsed as Record<string, unknown>;
+	if (runner.type === "pi") {
+		if (Object.keys(runner).some((key) => key !== "type")) throw new Error(`Agent '${agentName}' has invalid Pi runner frontmatter; only 'type' is supported.`);
+		return { type: "pi" };
+	}
+	if (runner.type !== "external-cli") {
+		throw new Error(`Agent '${agentName}' has invalid runner.type; expected 'pi' or 'external-cli'.`);
+	}
+	if (typeof runner.command !== "string" || !runner.command.trim()) {
+		throw new Error(`Agent '${agentName}' external-cli runner requires a non-empty command string.`);
+	}
+	if (runner.args !== undefined && (!Array.isArray(runner.args) || runner.args.some((arg) => typeof arg !== "string"))) {
+		throw new Error(`Agent '${agentName}' external-cli runner args must be an array of strings.`);
+	}
+	if (runner.promptDelivery !== undefined && runner.promptDelivery !== "stdin") {
+		throw new Error(`Agent '${agentName}' external-cli runner promptDelivery must be 'stdin'.`);
+	}
+	const supported = new Set(["type", "command", "args", "promptDelivery"]);
+	const unknown = Object.keys(runner).filter((key) => !supported.has(key));
+	if (unknown.length > 0) throw new Error(`Agent '${agentName}' external-cli runner has unsupported fields: ${unknown.join(", ")}.`);
+	const runnerArgs = Array.isArray(runner.args) ? runner.args.filter((arg): arg is string => typeof arg === "string") : undefined;
+	return {
+		type: "external-cli",
+		command: runner.command.trim(),
+		...(runnerArgs?.length ? { args: runnerArgs } : {}),
+		...(runner.promptDelivery ? { promptDelivery: "stdin" as const } : {}),
+	};
+}
+
+function validateExternalRunnerProfile(frontmatter: Record<string, string>, agentName: string, runner: AgentRunnerConfig | undefined): void {
+	if (runner?.type !== "external-cli") return;
+	const unsupported = ["tools", "model", "fallbackModels", "thinking", "extensions", "subagentOnlyExtensions", "maxSubagentDepth", "completionGuard", "skills", "skill", "skillPath", "toolBudget", "permission", "permissions"]
+		.filter((field) => frontmatter[field] !== undefined);
+	if (unsupported.length > 0) {
+		throw new Error(`Agent '${agentName}' uses runner.type='external-cli' and declares unsupported Pi-only fields: ${unsupported.join(", ")}.`);
+	}
+}
+
 function parseAgentAcceptanceFrontmatter(raw: string | undefined, agentName: string): AcceptanceInput | undefined {
 	if (raw === undefined || !raw.trim()) return undefined;
 	let parsed: unknown;
@@ -1330,11 +1508,14 @@ function loadAgentsFromDir(dir: string, source: AgentSource): AgentConfig[] {
 		const packageName = parsedPackage.packageName;
 		const runtimeName = buildRuntimeName(localName, packageName);
 
+		const runner = parseAgentRunnerFrontmatter(frontmatter.runner, localName);
+		validateExternalRunnerProfile(frontmatter, localName, runner);
 		const rawTools = parseFrontmatterList(frontmatter.tools);
 		const parsedTools = splitToolList(rawTools);
 		const tools = parsedTools.tools ?? [];
 		const mcpDirectTools = parsedTools.mcpDirectTools ?? [];
 		const defaultReads = parseFrontmatterList(frontmatter.defaultReads);
+		const aliases = normalizeAgentAliases(parseFrontmatterList(frontmatter.aliases ?? frontmatter.alias), runtimeName);
 		const skillStr = frontmatter.skill || frontmatter.skills;
 		const skills = parseFrontmatterList(skillStr);
 		const skillPath = parseFrontmatterList(frontmatter.skillPath);
@@ -1396,6 +1577,13 @@ function loadAgentsFromDir(dir: string, source: AgentSource): AgentConfig[] {
 		}
 
 		const parsedMaxSubagentDepth = Number(frontmatter.maxSubagentDepth);
+		if (frontmatter.permission !== undefined && frontmatter.permissions !== undefined) {
+			throw new Error(`Agent '${localName}' cannot declare both permission and permissions frontmatter.`);
+		}
+		const permissionSource = frontmatter.permissions ?? frontmatter.permission;
+		const permissions = permissionSource?.trim()
+			? validatePermissionRules(parseYaml(permissionSource), `Agent '${localName}' permissions`)
+			: undefined;
 		let toolBudget: ToolBudgetConfig | undefined;
 		if (frontmatter.toolBudget !== undefined && frontmatter.toolBudget.trim()) {
 			const parsed = JSON.parse(frontmatter.toolBudget) as unknown;
@@ -1410,44 +1598,48 @@ function loadAgentsFromDir(dir: string, source: AgentSource): AgentConfig[] {
 				? true
 				: undefined;
 
+		const maxSubagentDepth = Number.isInteger(parsedMaxSubagentDepth) && parsedMaxSubagentDepth >= 0
+			? parsedMaxSubagentDepth
+			: undefined;
+		const memory = parseMemoryFrontmatter(frontmatter.memory);
 		const agent: AgentConfig = {
 			name: runtimeName,
+			...(runner !== undefined ? { runner } : {}),
 			localName,
-			packageName,
+			...(packageName !== undefined ? { packageName } : {}),
 			description: frontmatter.description,
-			tools: rawTools !== undefined ? tools : undefined,
-			mcpDirectTools: mcpDirectTools.length > 0 ? mcpDirectTools : undefined,
-			model: frontmatter.model,
-			fallbackModels: fallbackModels && fallbackModels.length > 0 ? fallbackModels : undefined,
-			thinking: frontmatter.thinking === "false" ? false : frontmatter.thinking,
+			...(aliases !== undefined ? { aliases } : {}),
+			...(rawTools !== undefined ? { tools } : {}),
+			...(mcpDirectTools.length > 0 ? { mcpDirectTools } : {}),
+			...(frontmatter.model !== undefined ? { model: frontmatter.model } : {}),
+			...(fallbackModels?.length ? { fallbackModels } : {}),
+			...(frontmatter.thinking !== undefined ? { thinking: frontmatter.thinking === "false" ? false : frontmatter.thinking } : {}),
 			systemPromptMode,
 			inheritProjectContext,
 			inheritSkills,
-			defaultContext,
-			defaultAsync,
-			defaultTimeoutMs,
-			defaultTurnBudget,
-			defaultAcceptance,
-			acceptanceRole,
+			...(defaultContext !== undefined ? { defaultContext } : {}),
+			...(defaultAsync !== undefined ? { defaultAsync } : {}),
+			...(defaultTimeoutMs !== undefined ? { defaultTimeoutMs } : {}),
+			...(defaultTurnBudget !== undefined ? { defaultTurnBudget } : {}),
+			...(defaultAcceptance !== undefined ? { defaultAcceptance } : {}),
+			...(acceptanceRole !== undefined ? { acceptanceRole } : {}),
 			systemPrompt: body,
 			source,
 			filePath,
-			skills: skills && skills.length > 0 ? skills : undefined,
-			skillPath: skillPath && skillPath.length > 0 ? skillPath : undefined,
-			extensions,
-			subagentOnlyExtensions,
-			output: frontmatter.output,
-			defaultReads: defaultReads && defaultReads.length > 0 ? defaultReads : undefined,
+			...(skills?.length ? { skills } : {}),
+			...(skillPath?.length ? { skillPath } : {}),
+			...(extensions !== undefined ? { extensions } : {}),
+			...(subagentOnlyExtensions !== undefined ? { subagentOnlyExtensions } : {}),
+			...(frontmatter.output !== undefined ? { output: frontmatter.output } : {}),
+			...(defaultReads?.length ? { defaultReads } : {}),
 			defaultProgress: frontmatter.defaultProgress === "true",
 			interactive: frontmatter.interactive === "true",
-			maxSubagentDepth:
-				Number.isInteger(parsedMaxSubagentDepth) && parsedMaxSubagentDepth >= 0
-					? parsedMaxSubagentDepth
-					: undefined,
-			completionGuard,
-			toolBudget,
-			memory: parseMemoryFrontmatter(frontmatter.memory),
-			extraFields: Object.keys(extraFields).length > 0 ? extraFields : undefined,
+			...(maxSubagentDepth !== undefined ? { maxSubagentDepth } : {}),
+			...(completionGuard !== undefined ? { completionGuard } : {}),
+			...(toolBudget !== undefined ? { toolBudget } : {}),
+			...(permissions !== undefined ? { permissions } : {}),
+			...(memory !== undefined ? { memory } : {}),
+			...(Object.keys(extraFields).length > 0 ? { extraFields } : {}),
 		};
 		agentFrontmatterFields.set(agent, new Set(Object.keys(frontmatter)));
 		agents.push(agent);
@@ -1491,7 +1683,7 @@ function isDirectory(p: string): boolean {
 }
 
 function resolveNearestProjectAgentDirs(cwd: string): { readDirs: string[]; preferredDir: string | null } {
-	const projectRoot = findNearestProjectRoot(cwd);
+	const projectRoot = findConfiguredProjectRoot(cwd);
 	if (!projectRoot) return { readDirs: [], preferredDir: null };
 
 	const legacyDir = path.join(projectRoot, ".agents");
@@ -1507,7 +1699,7 @@ function resolveNearestProjectAgentDirs(cwd: string): { readDirs: string[]; pref
 }
 
 function resolveNearestProjectChainDirs(cwd: string): { readDirs: string[]; preferredDir: string | null } {
-	const projectRoot = findNearestProjectRoot(cwd);
+	const projectRoot = findConfiguredProjectRoot(cwd);
 	if (!projectRoot) return { readDirs: [], preferredDir: null };
 
 	const preferredDir = path.join(getProjectConfigDir(projectRoot), "chains");
@@ -1587,7 +1779,7 @@ export function discoverAgents(cwd: string, scope: AgentScope): AgentDiscoveryRe
 	const agents = mergeAgentsForScope(scope, userAgents, projectAgents, builtinAgents, packageAgents)
 		.filter((agent) => agent.disabled !== true);
 
-	return { agents, projectAgentsDir, modelScope };
+	return { agents, projectAgentsDir, ...(modelScope !== undefined ? { modelScope } : {}) };
 }
 
 export function discoverAgentsAll(cwd: string): {

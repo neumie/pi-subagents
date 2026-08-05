@@ -10,7 +10,7 @@ import {
 	type SteeringNotice,
 	type SubagentState,
 	POLL_INTERVAL_MS,
-	RESULTS_DIR,
+	DIRS,
 	SUBAGENT_CONTROL_EVENT,
 	SUBAGENT_CONTROL_INTERCOM_EVENT,
 	SUBAGENT_STEERING_NOTICE_EVENT,
@@ -54,7 +54,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 } {
 	const completionRetentionMs = options.completionRetentionMs ?? 10000;
 	const pollIntervalMs = options.pollIntervalMs ?? POLL_INTERVAL_MS;
-	const resultsDir = options.resultsDir ?? RESULTS_DIR;
+	const resultsDir = options.resultsDir ?? DIRS.results;
 	const steeringNoticeSeen = new Map<string, number>();
 	const rerenderWidget = (ctx: ExtensionContext, jobs = Array.from(state.asyncJobs.values())) => {
 		renderWidget(ctx, options.widgetEnabled === false ? [] : jobs);
@@ -131,6 +131,9 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 			sessionFile: run.sessionFile,
 			controlEventCursor: restoredControlEventCursor(run.asyncDir),
 			nestedChildren: run.nestedChildren,
+			parentWorkflowRunId: run.parentWorkflowRunId,
+			workflowKey: run.workflowKey,
+			workflow: run.workflow,
 		};
 	};
 	const cancelCleanup = (asyncId: string) => {
@@ -165,6 +168,10 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 			const startedFromTail = savedCursor === undefined && stat.size > CONTROL_EVENT_SCAN_WINDOW_BYTES;
 			if (startedFromTail) cursor = stat.size - CONTROL_EVENT_SCAN_WINDOW_BYTES;
 			if (stat.size <= cursor) return;
+			const previousByte = Buffer.alloc(1);
+			const startsMidLine = cursor > 0
+				&& fs.readSync(fd, previousByte, 0, 1, cursor - 1) === 1
+				&& previousByte[0] !== 0x0a;
 			const scanEnd = Math.min(stat.size, cursor + CONTROL_EVENT_SCAN_WINDOW_BYTES);
 			const handleLine = (line: string) => {
 				if (!line.trim()) return;
@@ -217,7 +224,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 			let lastCompleteCursor = cursor;
 			let lineParts: Buffer[] = [];
 			let lineBytes = 0;
-			let skippingOversizedLine = startedFromTail;
+			let skippingOversizedLine = startedFromTail || startsMidLine;
 			const appendLineSegment = (segment: Buffer) => {
 				if (segment.length === 0 || skippingOversizedLine) return;
 				if (lineBytes + segment.length > MAX_CONTROL_EVENT_LINE_BYTES) {
@@ -328,6 +335,9 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 						job.toolCount = status.toolCount ?? job.toolCount;
 						job.steering = status.steering ?? job.steering;
 						job.mode = status.mode;
+						job.parentWorkflowRunId = status.parentWorkflowRunId ?? job.parentWorkflowRunId;
+						job.workflowKey = status.workflowKey ?? job.workflowKey;
+						job.workflow = status.workflow ?? job.workflow;
 						job.currentStep = status.currentStep ?? job.currentStep;
 						job.chainStepCount = status.chainStepCount ?? job.chainStepCount;
 						job.startedAt = status.startedAt ?? job.startedAt;
@@ -428,6 +438,8 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 			timeoutMs: info.timeoutMs,
 			deadlineAt: info.deadlineAt,
 			turnBudget: info.turnBudget,
+			parentWorkflowRunId: info.parentWorkflowRunId,
+			workflowKey: info.workflowKey,
 			controlEventCursor: 0,
 		});
 		rememberFleetJob(state, state.asyncJobs.get(info.id)!);

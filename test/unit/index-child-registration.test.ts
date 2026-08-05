@@ -71,7 +71,7 @@ describe("subagent extension child mode", () => {
 		);
 	});
 
-	it("does not show async badge for explicit foreground clarify chain calls", () => {
+	it("renders only the public single and workflow execution modes", () => {
 		const script = String.raw`
 			import registerSubagentExtension from "./index.ts";
 			const events = { on() { return () => {}; }, emit() {} };
@@ -79,40 +79,17 @@ describe("subagent extension child mode", () => {
 			const fakePi = new Proxy({
 				events,
 				registerTool(tool) { if (tool.name === "subagent") registeredTool = tool; },
-				registerCommand() {},
-				registerShortcut() {},
-				registerMessageRenderer() {},
-				sendMessage() {},
-				getSessionName() { return undefined; },
-			}, {
-				get(target, prop) {
-					if (prop in target) return target[prop];
-					return () => undefined;
-				},
-			});
+				registerCommand() {}, registerShortcut() {}, registerMessageRenderer() {}, sendMessage() {}, getSessionName() {},
+			}, { get(target, prop) { return prop in target ? target[prop] : () => undefined; } });
 			registerSubagentExtension(fakePi);
 			if (!registeredTool) throw new Error("tool not registered");
 			const theme = { fg(_name, text) { return text; }, bold(text) { return text; } };
-			const asyncChain = registeredTool.renderCall({ chain: [{ agent: "worker" }, { agent: "reviewer" }], async: true }, theme).text;
-			const asyncParallel = registeredTool.renderCall({ tasks: [{ agent: "worker" }, { agent: "reviewer", count: 2 }], async: true }, theme).text;
-			const clarifyChain = registeredTool.renderCall({ chain: [{ agent: "worker" }, { agent: "reviewer" }], async: true, clarify: true }, theme).text;
-			if (!asyncChain.includes("[async]")) throw new Error("expected async chain badge, got " + asyncChain);
-			if (!asyncParallel.includes("parallel (3) [async]")) throw new Error("expected async parallel badge, got " + asyncParallel);
-			if (clarifyChain.includes("[async]")) throw new Error("unexpected clarify async badge: " + clarifyChain);
+			const single = registeredTool.renderCall({ agent: "worker", async: true }, theme).text;
+			const workflow = registeredTool.renderCall({ workflowScript: "return null" }, theme).text;
+			if (!single.includes("worker [async]")) throw new Error("expected async single badge, got " + single);
+			if (!workflow.includes("workflow script")) throw new Error("expected workflow label, got " + workflow);
 		`;
-
-		execFileSync(
-			process.execPath,
-			[
-				"--experimental-strip-types",
-				"--import",
-				"./test/support/register-loader.mjs",
-				"--input-type=module",
-				"--eval",
-				script,
-			],
-			{ cwd: projectRoot, env: parentToolEnv(), stdio: "pipe" },
-		);
+		execFileSync(process.execPath, ["--experimental-strip-types", "--import", "./test/support/register-loader.mjs", "--input-type=module", "--eval", script], { cwd: projectRoot, env: parentToolEnv(), stdio: "pipe" });
 	});
 
 	it("does not animate foreground results on a timer", () => {
@@ -261,6 +238,90 @@ describe("subagent extension child mode", () => {
 		} finally {
 			fs.rmSync(agentDir, { recursive: true, force: true });
 		}
+	});
+
+	it("shows active async work in the under-editor widget when FleetView is enabled", () => {
+		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-async-widget-fleet-"));
+		try {
+			const configDir = path.join(agentDir, "extensions", "subagent");
+			fs.mkdirSync(configDir, { recursive: true });
+			fs.writeFileSync(path.join(configDir, "config.json"), JSON.stringify({ fleetView: true }), "utf-8");
+			const script = String.raw`
+				import registerSubagentExtension from "./index.ts";
+				const eventHandlers = new Map();
+				const handlers = new Map();
+				const events = { on(channel, handler) { eventHandlers.set(channel, handler); return () => {}; }, emit() {} };
+				const fakePi = new Proxy({
+					events,
+					on(channel, handler) { handlers.set(channel, handler); },
+					registerTool() {}, registerCommand() {}, registerShortcut() {}, registerMessageRenderer() {},
+					sendMessage() {}, getSessionName() { return undefined; },
+				}, { get(target, prop) { return prop in target ? target[prop] : () => undefined; } });
+				const widgets = [];
+				const ctx = {
+					cwd: process.cwd(), hasUI: true,
+					ui: { setWidget(key, value) { widgets.push({ key, value }); }, requestRender() {}, theme: { fg(_name, text) { return text; }, bg(_name, text) { return text; }, bold(text) { return text; } } },
+					sessionManager: { getSessionId() { return "session-widget"; }, getSessionFile() { return null; }, getEntries() { return []; } },
+					modelRegistry: { getAvailable() { return []; } },
+				};
+				registerSubagentExtension(fakePi);
+				handlers.get("session_start")({}, ctx);
+				widgets.length = 0;
+				eventHandlers.get("subagent:async-started")({ id: "widget-run", pid: 1, sessionId: "session-widget", mode: "workflow", agent: "worker", asyncDir: "/tmp/widget-run" });
+				handlers.get("tool_result")({ toolName: "subagent" }, ctx);
+				const asyncWidgets = widgets.filter((entry) => entry.key === "subagent-async");
+				if (!asyncWidgets.some((entry) => entry.value !== undefined)) throw new Error("async widget was not rendered with FleetView enabled: " + JSON.stringify(asyncWidgets));
+				handlers.get("session_shutdown")();
+			`;
+			const env = parentToolEnv();
+			env.PI_CODING_AGENT_DIR = agentDir;
+			execFileSync(process.execPath, ["--experimental-strip-types", "--import", "./test/support/register-loader.mjs", "--input-type=module", "--eval", script], { cwd: projectRoot, env, stdio: "pipe" });
+		} finally {
+			fs.rmSync(agentDir, { recursive: true, force: true });
+		}
+	});
+
+	it("restores disk-backed active status after a management tool result", () => {
+		const script = String.raw`
+			import * as fs from "node:fs";
+			import * as path from "node:path";
+			import registerSubagentExtension from "./index.ts";
+			import { DIRS } from "./src/shared/types.ts";
+			const eventHandlers = new Map();
+			const handlers = new Map();
+			const events = { on(channel, handler) { eventHandlers.set(channel, handler); return () => {}; }, emit() {} };
+			const widgets = [];
+			const fakePi = new Proxy({
+				events,
+				on(channel, handler) { handlers.set(channel, handler); },
+				registerTool() {}, registerCommand() {}, registerShortcut() {}, registerMessageRenderer() {},
+				sendMessage() {}, getSessionName() { return undefined; },
+			}, { get(target, prop) { return prop in target ? target[prop] : () => undefined; } });
+			const runId = "management-refresh-" + crypto.randomUUID();
+			const sessionId = "session-" + runId;
+			const ctx = {
+				cwd: process.cwd(), hasUI: true,
+				ui: { setWidget(key, value) { widgets.push({ key, value }); }, requestRender() {}, theme: { fg(_name, text) { return text; }, bg(_name, text) { return text; }, bold(text) { return text; } } },
+				sessionManager: { getSessionId() { return sessionId; }, getSessionFile() { return null; }, getEntries() { return []; } },
+				modelRegistry: { getAvailable() { return []; } },
+			};
+			const asyncDir = path.join(DIRS.async, runId);
+			fs.rmSync(asyncDir, { recursive: true, force: true });
+			registerSubagentExtension(fakePi);
+			handlers.get("session_start")({}, ctx);
+			widgets.length = 0;
+			fs.mkdirSync(asyncDir, { recursive: true });
+			fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({
+				runId, sessionId, mode: "workflow", state: "running",
+				startedAt: Date.now(), lastUpdate: Date.now(), cwd: process.cwd(), pid: process.pid,
+			}), "utf-8");
+			handlers.get("tool_result")({ toolName: "subagent" }, ctx);
+			const fleetWidgets = widgets.filter((entry) => entry.key === "subagent-fleet-status");
+			if (!fleetWidgets.some((entry) => typeof entry.value === "function")) throw new Error("management result did not restore active fleet status: " + JSON.stringify(fleetWidgets));
+			handlers.get("session_shutdown")();
+			fs.rmSync(asyncDir, { recursive: true, force: true });
+		`;
+		execFileSync(process.execPath, ["--experimental-strip-types", "--import", "./test/support/register-loader.mjs", "--input-type=module", "--eval", script], { cwd: projectRoot, env: parentToolEnv(), stdio: "pipe" });
 	});
 
 	it("disposes pending completion notifications on session shutdown", () => {

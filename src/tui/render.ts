@@ -24,6 +24,7 @@ import { flatToLogicalStepIndex } from "../runs/background/parallel-groups.ts";
 import { formatNestedAggregate } from "../runs/shared/nested-render.ts";
 import { aggregateStepStatus, formatActivityLabel, formatAgentRunningLabel, formatParallelOutcome } from "../shared/status-format.ts";
 import { contextModeBadge, contextModePrefix } from "../runs/shared/context-mode.ts";
+import { buildWorkflowChatProgressRows, type WorkflowChatProgressRow } from "../workflows/chat-progress.ts";
 
 type Theme = ExtensionContext["ui"]["theme"];
 
@@ -471,7 +472,7 @@ function widgetParallelAgentDetails(job: AsyncJobState, theme: Theme, expanded =
 		const itemTitle = job.mode === "parallel" || job.activeParallelGroup ? "Agent" : "Step";
 		const modelDisplay = modelThinkingBadge(theme, step.model, step.thinking);
 		lines.push(`  ${theme.fg("dim", `${marker} ${widgetStepGlyph(step.status, theme, widgetStepRunningSeed(step, index))} ${itemTitle} ${index + 1}/${total}: ${step.agent} · ${widgetStepStatus(step.status, theme)}${modelDisplay}${activity ? ` · ${activity}` : ""}`)}`);
-		for (const nestedLine of formatNestedWidgetLines(step.children, theme, width, expanded, job.updatedAt, expanded ? 8 : 1)) lines.push(`    ${nestedLine}`);
+		for (const nestedLine of formatNestedWidgetLines(step.children, theme, width, expanded, job.updatedAt, expanded ? 8 : 6)) lines.push(`    ${nestedLine}`);
 	}
 	return lines;
 }
@@ -847,9 +848,56 @@ function nestedActivity(input: Pick<NestedRunSummary | NestedStepSummary, "activ
 function formatNestedWidgetLines(children: NestedRunSummary[] | undefined, theme: Theme, width: number, expanded: boolean, snapshotNow?: number, lineBudget = expanded ? 12 : 1): string[] {
 	if (!children?.length || lineBudget <= 0) return [];
 	if (!expanded) {
-		const aggregate = formatNestedAggregate(children);
-		const latest = children.reduce((acc, child) => Math.max(acc, nestedRunEventTime(child) ?? 0), 0);
-		return aggregate ? [theme.fg("dim", `↳ ${nestedTimestampPrefix(formatClockTime(latest))}${aggregate}`)] : [];
+		type CollapsedRow = { text: string; prefix: string };
+		const rows: CollapsedRow[] = [];
+		const maxLeaves = 4;
+		const maxLines = Math.min(6, lineBudget);
+		let leaves = 0;
+		let overflow = 0;
+		const appendLeaf = (step: NestedStepSummary | NestedRunSummary, prefix: string, fallback?: number): void => {
+			if (leaves >= maxLeaves) {
+				overflow++;
+				return;
+			}
+			leaves++;
+			const state = "status" in step ? step.status : step.state;
+			const modelThinking = formatModelThinking(step.model, step.thinking);
+			const activity = nestedActivity(step, state, snapshotNow ?? fallback);
+			const timestamp = "status" in step ? nestedStepTimestamp(step, fallback) : formatClockTime(nestedRunEventTime(step));
+			const error = step.error ? ` · ${step.error}` : "";
+			const name = "status" in step ? step.agent : nestedRunName(step);
+			rows.push({
+				prefix,
+				text: `${nestedTimestampPrefix(timestamp)}${nestedStatusGlyph(state, theme)} ${name} · ${state}${modelThinking ? ` · ${modelThinking}` : ""}${activity ? ` · ${activity}` : ""}${error}`,
+			});
+		};
+		for (const child of children) {
+			const steps = (child.mode === "parallel" || child.mode === "chain") ? child.steps ?? [] : [];
+			if (steps.length > 0) {
+				const ownerModelThinking = formatModelThinking(child.model, child.thinking);
+				const ownerActivity = nestedActivity(child, child.state, snapshotNow ?? child.lastUpdate);
+				const ownerError = child.error ? ` · ${child.error}` : "";
+				rows.push({
+					prefix: "↳ ",
+					text: `OWNER ${nestedStatusGlyph(child.state, theme, nestedRunSeed(child))} ${nestedRunName(child)} · ${child.state}${ownerModelThinking ? ` · ${ownerModelThinking}` : ""}${ownerActivity ? ` · ${ownerActivity}` : ""}${ownerError}`,
+				});
+				for (const step of steps) appendLeaf(step, "↳ │  ", child.lastUpdate);
+			} else {
+				appendLeaf(child, "↳ ", child.lastUpdate);
+			}
+		}
+		if (overflow > 0) rows.push({ prefix: "↳ ", text: `… +${overflow} more nested leaves` });
+		const visibleRows = rows.length <= maxLines
+			? rows
+			: overflow > 0
+				? [...rows.slice(0, Math.max(0, maxLines - 1)), rows.at(-1)!]
+				: rows.slice(0, maxLines);
+		return visibleRows.map((row, index) => {
+			const marker = index === visibleRows.length - 1 ? "└─" : "├─";
+			const prefix = row.prefix;
+			const text = row.text.startsWith("OWNER ") ? row.text.slice("OWNER ".length) : row.text;
+			return truncLine(theme.fg("dim", `${prefix}${marker} ${text}`), width);
+		});
 	}
 	const lines: string[] = [];
 	const maxDepth = 2;
@@ -869,7 +917,8 @@ function formatNestedWidgetLines(children: NestedRunSummary[] | undefined, theme
 			}
 			const activity = nestedActivity(child, child.state, snapshotNow ?? child.lastUpdate);
 			const error = child.error ? ` · ${child.error}` : "";
-			lines.push(theme.fg("dim", `${prefix}↳ ${nestedTimestampPrefix(formatClockTime(nestedRunEventTime(child)))}${nestedStatusGlyph(child.state, theme, nestedRunSeed(child))} ${nestedRunName(child)} · ${child.state} · ${activity}${error}`));
+			const modelThinking = formatModelThinking(child.model, child.thinking);
+			lines.push(theme.fg("dim", `${prefix}↳ ${nestedTimestampPrefix(formatClockTime(nestedRunEventTime(child)))}${nestedStatusGlyph(child.state, theme, nestedRunSeed(child))} ${nestedRunName(child)} · ${child.state}${modelThinking ? ` · ${modelThinking}` : ""} · ${activity}${error}`));
 			if (depth === maxDepth) {
 				const aggregate = formatNestedAggregate([...(child.steps?.flatMap((step) => step.children ?? []) ?? []), ...(child.children ?? [])]);
 				if (aggregate && lines.length < lineBudget) lines.push(theme.fg("dim", `${prefix}  ↳ ${aggregate}`));
@@ -877,7 +926,8 @@ function formatNestedWidgetLines(children: NestedRunSummary[] | undefined, theme
 			}
 			for (const step of child.steps ?? []) {
 				if (lines.length >= lineBudget) return;
-				lines.push(theme.fg("dim", `${prefix}  ↳ ${nestedTimestampPrefix(nestedStepTimestamp(step, child.lastUpdate))}${nestedStatusGlyph(step.status, theme)} ${step.agent} · ${step.status} · ${nestedActivity(step, step.status, snapshotNow ?? child.lastUpdate)}`));
+				const modelThinking = formatModelThinking(step.model, step.thinking);
+				lines.push(theme.fg("dim", `${prefix}  ↳ ${nestedTimestampPrefix(nestedStepTimestamp(step, child.lastUpdate))}${nestedStatusGlyph(step.status, theme)} ${step.agent} · ${step.status}${modelThinking ? ` · ${modelThinking}` : ""} · ${nestedActivity(step, step.status, snapshotNow ?? child.lastUpdate)}`));
 				append(step.children, depth + 1, `${prefix}    `);
 			}
 			append(child.children, depth + 1, `${prefix}  `);
@@ -903,7 +953,7 @@ function foregroundStyleWidgetStepLines(
 	const lines = [`  ${widgetStepGlyph(step.status, theme, widgetStepRunningSeed(step, index - 1))} ${itemTitle} ${index}/${total}: ${themeBold(theme, step.agent)}${contextModeBadge(theme, step.context)} ${theme.fg("dim", "·")} ${status}${modelDisplay}${stats ? ` ${theme.fg("dim", "·")} ${stats}` : ""}`];
 	const activity = widgetStepActivityLine(step, width, expanded, job.updatedAt);
 	if (activity) lines.push(`    ${theme.fg("dim", `⎿  ${activity}`)}`);
-	for (const nestedLine of formatNestedWidgetLines(step.children, theme, width, expanded, job.updatedAt)) {
+	for (const nestedLine of formatNestedWidgetLines(step.children, theme, width, expanded, job.updatedAt, expanded ? 12 : 6)) {
 		lines.push(`    ${nestedLine}`);
 	}
 	if (step.status === "running") {
@@ -929,7 +979,7 @@ function foregroundStyleWidgetStepLines(
 function foregroundStyleWidgetDetails(job: AsyncJobState, theme: Theme, expanded: boolean, width: number): string[] {
 	if (!job.steps?.length) return [
 		`  ${theme.fg("dim", `⎿  ${widgetActivity(job)}`)}`,
-		...formatNestedWidgetLines(job.nestedChildren, theme, width, expanded, job.updatedAt).map((line) => `  ${line}`),
+		...formatNestedWidgetLines(job.nestedChildren, theme, width, expanded, job.updatedAt, expanded ? 12 : 6).map((line) => `  ${line}`),
 	];
 	if (job.mode === "chain" && !job.activeParallelGroup && job.parallelGroups?.length) return widgetChainDetails(job, theme, expanded, width);
 	const total = job.stepsTotal ?? job.steps.length;
@@ -940,7 +990,7 @@ function foregroundStyleWidgetDetails(job: AsyncJobState, theme: Theme, expanded
 	}
 	const attached = new Set(job.steps.flatMap((step) => step.children?.map((child) => child.id) ?? []));
 	const unattached = job.nestedChildren?.filter((child) => !attached.has(child.id)) ?? [];
-	for (const nestedLine of formatNestedWidgetLines(unattached, theme, width, expanded, job.updatedAt)) {
+	for (const nestedLine of formatNestedWidgetLines(unattached, theme, width, expanded, job.updatedAt, expanded ? 12 : 6)) {
 		lines.push(`  ${nestedLine}`);
 	}
 	return lines;
@@ -972,7 +1022,7 @@ function compactSingleWidgetLines(job: AsyncJobState, theme: Theme, width: numbe
 		const activitySuffix = activity ? ` ${theme.fg("dim", "·")} ${theme.fg("dim", activity)}` : "";
 		const modelDisplay = modelThinkingBadge(theme, step.model, step.thinking);
 		lines.push(`  ${widgetStepGlyph(step.status, theme, widgetStepRunningSeed(step, index))} ${itemTitle} ${index + 1}/${total}: ${themeBold(theme, step.agent)}${contextModeBadge(theme, step.context)} ${theme.fg("dim", "·")} ${status}${modelDisplay}${activitySuffix}${stepStats ? ` ${theme.fg("dim", "·")} ${stepStats}` : ""}`);
-		for (const nestedLine of formatNestedWidgetLines(step.children, theme, width, false, job.updatedAt)) lines.push(`    ${nestedLine}`);
+		for (const nestedLine of formatNestedWidgetLines(step.children, theme, width, false, job.updatedAt, 6)) lines.push(`    ${nestedLine}`);
 	}
 	if (job.steps.some((step) => step.status === "running")) lines.push(theme.fg("accent", `  ${liveDetailHintText()}`));
 	return lines.map((line) => truncLine(line, width));
@@ -1318,7 +1368,7 @@ function renderSingleCompact(d: Details, r: Details["results"][number], theme: T
 	]);
 	const c = new Container();
 	const width = getTermWidth() - 4;
-	const modelDisplay = modelThinkingBadge(theme, r.model);
+	const modelDisplay = modelThinkingBadge(theme, r.model ?? r.progress?.model, r.thinking ?? r.progress?.thinking);
 	c.addChild(new Text(truncLine(`${resultGlyph(r, output, theme, isRunning, undefined, frame)} ${theme.fg("toolTitle", theme.bold(r.agent))}${modelDisplay}${contextBadge}${stats ? ` ${theme.fg("dim", "·")} ${stats}` : ""}`, width), 0, 0));
 
 	if (isRunning && r.progress) {
@@ -1346,6 +1396,54 @@ function renderSingleCompact(d: Details, r: Details["results"][number], theme: T
 	if (r.sessionFile) c.addChild(new Text(truncLine(theme.fg("dim", `  session: ${shortenPath(r.sessionFile)}`), width), 0, 0));
 	if (r.artifactPaths) c.addChild(new Text(truncLine(theme.fg("dim", `  output: ${shortenPath(r.artifactPaths.outputPath)}`), width), 0, 0));
 	if (r.truncation?.artifactPath) c.addChild(new Text(truncLine(theme.fg("dim", `  full output: ${shortenPath(r.truncation.artifactPath)}`), width), 0, 0));
+	return c;
+}
+
+function workflowRowGlyph(row: WorkflowChatProgressRow, theme: Theme, frame?: number): string {
+	if (row.state === "running") return theme.fg("accent", runningGlyph(frame));
+	if (row.state === "complete") return theme.fg("success", "✓");
+	return theme.fg("error", "✗");
+}
+
+function workflowRowStateLabel(row: WorkflowChatProgressRow, theme: Theme): string {
+	const label = (row.state === "complete" ? "complete" : row.state).padEnd(8);
+	if (row.state === "running") return theme.fg("accent", label);
+	if (row.state === "complete") return theme.fg("success", label);
+	return theme.fg("error", label);
+}
+
+function workflowOverallState(rows: WorkflowChatProgressRow[], hasTerminalValue: boolean, isError?: boolean): "running" | "complete" | "failed" {
+	if (isError || rows.some((row) => row.state === "failed")) return "failed";
+	if ((rows.length > 0 && rows.every((row) => row.state === "complete")) || hasTerminalValue) return "complete";
+	return "running";
+}
+
+function renderWorkflowChatProgress(d: Details, result: AgentToolResult<Details>, theme: Theme, frame?: number): Component {
+	const workflow = d.workflow;
+	const rows = workflow ? buildWorkflowChatProgressRows(workflow.trace) : [];
+	const state = workflowOverallState(rows, workflow?.value !== undefined, result.isError);
+	const glyph = state === "running" ? theme.fg("accent", runningGlyph(frame)) : state === "complete" ? theme.fg("success", "✓") : theme.fg("error", "✗");
+	const width = getTermWidth() - 4;
+	const runId = d.runId ? d.runId.slice(0, 12) : "workflow";
+	const repoLabel = d.chatProgress?.repoLabel ?? (d.chatProgress?.repoRelation === "same" ? "same repo" : "other repo");
+	const phase = rows.find((row) => row.state === "running" && row.phase)?.phase ?? [...rows].reverse().find((row) => row.phase)?.phase;
+	const c = new Container();
+	c.addChild(new Text(truncLine(`${glyph} ${theme.fg("toolTitle", theme.bold("workflow"))} ${runId} ${theme.fg("dim", "·")} ${d.chatProgress?.repoRelation === "same" ? "same repo" : "other repo"} ${theme.fg("dim", "·")} ${state}`, width), 0, 0));
+	c.addChild(new Text(truncLine(theme.fg("dim", `  Repo   ${repoLabel}`), width), 0, 0));
+	if (phase) c.addChild(new Text(truncLine(theme.fg("dim", `  Phase  ${phase}`), width), 0, 0));
+	if (rows.length === 0) {
+		c.addChild(new Text(truncLine(theme.fg("dim", "  ◦ waiting for workflow child launches"), width), 0, 0));
+		return c;
+	}
+	for (const row of rows) {
+		const status = workflowRowStateLabel(row, theme);
+		const label = row.label && row.label !== row.key ? ` ${row.label}` : "";
+		const duration = row.durationMs !== undefined ? ` ${theme.fg("dim", `· ${formatDuration(row.durationMs)}`)}` : "";
+		const run = row.runId ? ` ${theme.fg("dim", `[${row.runId.slice(0, 8)}]`)}` : "";
+		const error = row.error ? ` ${theme.fg("error", `· ${row.error}`)}` : "";
+		c.addChild(new Text(truncLine(`  ${workflowRowGlyph(row, theme, frame)} ${status} ${theme.bold(row.key)}${label}${run}${duration}${error}`, width), 0, 0));
+	}
+	if (workflow?.emits.length) c.addChild(new Text(truncLine(theme.fg("dim", `  Emits  ${workflow.emits.length}`), width), 0, 0));
 	return c;
 }
 
@@ -1428,12 +1526,15 @@ function renderMultiCompact(d: Details, theme: Theme, frame?: number): Component
 		const glyph = rPending ? theme.fg("dim", "◦") : resultGlyph(r, output, theme, rRunning, progressRunningSeed(rProg), frame);
 		const pendingLabel = rPending ? ` ${theme.fg("dim", "· pending")}` : "";
 		const stepLabel = entry.rowLabel ?? resultRowLabel(multiLabel, i, stepNumber);
-		const line = `${glyph} ${stepLabel}: ${themeBold(theme, agentName)}${contextModeBadge(theme, r.context)}${stepStats ? ` ${theme.fg("dim", "·")} ${stepStats}` : ""}${pendingLabel}`;
+		const rowProgressModel = rProg && "status" in rProg ? rProg : undefined;
+		const rowModelDisplay = modelThinkingBadge(theme, r.model ?? rowProgressModel?.model, r.thinking ?? rowProgressModel?.thinking);
+		const line = `${glyph} ${stepLabel}: ${themeBold(theme, agentName)}${contextModeBadge(theme, r.context)}${rowModelDisplay}${stepStats ? ` ${theme.fg("dim", "·")} ${stepStats}` : ""}${pendingLabel}`;
 		c.addChild(new Text(truncLine(`  ${line}`, width), 0, 0));
 		if (rRunning && rProg && "status" in rProg) {
-			const activity = compactCurrentActivity(rProg);
+			const liveProgress = rProg as AgentProgress;
+			const activity = compactCurrentActivity(liveProgress);
 			c.addChild(new Text(truncLine(theme.fg("dim", `    ⎿  ${activity}`), width), 0, 0));
-			for (const nestedLine of formatNestedWidgetLines(r.children, theme, width, false, snapshotNowForProgress(rProg))) {
+			for (const nestedLine of formatNestedWidgetLines(r.children, theme, width, false, snapshotNowForProgress(liveProgress))) {
 				c.addChild(new Text(truncLine(`    ${nestedLine}`, width), 0, 0));
 			}
 			c.addChild(new Text(truncLine(theme.fg("accent", `    ${liveDetailHintText()}`), width), 0, 0));
@@ -1463,6 +1564,7 @@ export function renderSubagentResult(
 	frame?: number,
 ): Component {
 	const d = result.details;
+	if (d?.mode === "workflow" && d.chatProgress?.mode === "live-card" && !result.isError && d.workflow?.value === undefined) return renderWorkflowChatProgress(d, result, theme, frame);
 	if (!d || !d.results.length) {
 		const t = result.content[0];
 		const text = t?.type === "text" ? t.text : "(no output)";
@@ -1488,6 +1590,7 @@ export function renderSubagentResult(
 
 	if (d.mode === "single" && d.results.length === 1) {
 		const r = d.results[0];
+		if (!r) return renderMultiCompact(d, theme, frame);
 		if (!expanded) return renderSingleCompact(d, r, theme, frame);
 		const isRunning = r.progress?.status === "running";
 		const icon = isRunning
@@ -1654,9 +1757,9 @@ export function renderSubagentResult(
 					const result = d.results[i];
 					const isFailed = result && result.exitCode !== 0 && result.progress?.status !== "running";
 					const isComplete = result && result.exitCode === 0 && result.progress?.status !== "running";
-					const isEmptyWithoutTarget = Boolean(result)
-						&& Boolean(isComplete)
-						&& hasEmptyTextOutputWithoutOutputTarget(result.task, getSingleResultOutput(result));
+					const isEmptyWithoutTarget = result
+						? Boolean(isComplete) && hasEmptyTextOutputWithoutOutputTarget(result.task, getSingleResultOutput(result))
+						: false;
 					const isCurrent = i === (d.currentStepIndex ?? d.results.length);
 					const stepIcon = isFailed
 						? theme.fg("error", "failed")

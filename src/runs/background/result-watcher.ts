@@ -8,6 +8,7 @@ import {
 	type NestedRunSummary,
 	type ParallelHandoffReference,
 	type SubagentResultIntercomChild,
+	type SubagentOutputState,
 	type SubagentState,
 } from "../../shared/types.ts";
 import {
@@ -45,10 +46,16 @@ type ResultWatcherDeps = {
 type ResultFileChild = {
 	agent?: string;
 	output?: string;
+	structuredOutput?: unknown;
+	outputState?: SubagentOutputState;
 	error?: string;
 	success?: boolean;
 	state?: string;
+	interrupted?: boolean;
+	timedOut?: boolean;
 	stopped?: boolean;
+	turnBudgetExceeded?: boolean;
+	processSignal?: string | null;
 	sessionFile?: string;
 	artifactPaths?: { outputPath?: string };
 	intercomTarget?: string;
@@ -174,11 +181,12 @@ export function createResultWatcher(
 			const hasResultChildren = Array.isArray(data.results) && data.results.length > 0;
 			const resultChildren: ResultFileChild[] = hasResultChildren
 				? data.results!
-				: [{ agent: data.agent ?? undefined, output: data.summary, success: data.success }];
+				: [{ agent: data.agent ?? undefined, output: data.summary, outputState: "unknown", success: data.success }];
 			const normalizedChildren = attachNestedChildrenToResultChildren(runId, resultChildren.map((result = {}, index): SubagentResultIntercomChild => {
-				const baseOutput = result.output ?? data.summary;
+				const baseOutput = hasResultChildren ? result.output : result.output ?? data.summary;
 				const hasRealOutput = typeof baseOutput === "string" && baseOutput.trim().length > 0;
-				const output = hasRealOutput ? baseOutput : "(no output)";
+				const structuredPreview = result.structuredOutput === undefined ? undefined : JSON.stringify(result.structuredOutput, null, 2).slice(0, 4_000);
+				const output = hasRealOutput ? baseOutput : structuredPreview ? `Structured output:\n${structuredPreview}` : "(no output)";
 				const summary = result.success === false && result.error
 					? `${result.error}${hasRealOutput ? `\n\nOutput:\n${baseOutput}` : ""}`
 					: output;
@@ -193,7 +201,18 @@ export function createResultWatcher(
 							: undefined;
 				return {
 					agent: result.agent ?? data.agent ?? `step-${index + 1}`,
-					status: resolveSubagentResultStatus({ success: result.success, state: childState }),
+					status: resolveSubagentResultStatus({
+						success: result.success,
+						state: childState,
+						interrupted: result.interrupted,
+						timedOut: result.timedOut,
+						stopped: result.stopped,
+						turnBudgetExceeded: result.turnBudgetExceeded,
+						processSignal: result.processSignal,
+					}),
+					outputState: result.outputState === "present" || result.outputState === "absent" || result.outputState === "unknown"
+						? result.outputState
+						: "unknown",
 					summary,
 					index,
 					artifactPath: result.artifactPaths?.outputPath,
@@ -206,7 +225,7 @@ export function createResultWatcher(
 			const intercomTarget = data.intercomTarget?.trim();
 			let intercomDelivered = false;
 			if (deliverIntercomResults && intercomTarget && triggerTurn) {
-				const mode = data.mode === "single" || data.mode === "parallel" || data.mode === "chain"
+				const mode = data.mode === "single" || data.mode === "parallel" || data.mode === "chain" || data.mode === "workflow"
 					? data.mode
 					: resultChildren.length > 1 ? "chain" : "single";
 				intercomDelivered = await deliverSubagentResultIntercomEvent(pi.events, buildSubagentResultIntercomPayload({
@@ -215,7 +234,7 @@ export function createResultWatcher(
 					mode,
 					source: "async",
 					children: normalizedChildren,
-					asyncId: data.id,
+					asyncId: data.id ?? undefined,
 					asyncDir: data.asyncDir,
 					...(data.parallelHandoff ? { parallelHandoff: data.parallelHandoff } : {}),
 				}));

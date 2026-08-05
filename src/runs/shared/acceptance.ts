@@ -169,6 +169,7 @@ export function validateAcceptanceInput(input: unknown, pathLabel = "acceptance"
 		if (input === "reviewed") errors.push(`${pathLabel} ${EXPLICIT_REVIEWED_UNAVAILABLE}`);
 		else if (!VALID_LEVELS.has(input as AcceptanceLevel)) errors.push(`${pathLabel} has invalid level '${input}'.`);
 		else if (input === "none") errors.push(`${pathLabel} level "none" requires a reason; use { level: "none", reason: "..." }.`);
+		else if (input === "verified") errors.push(`${pathLabel} level "verified" requires object form with at least one verify command.`);
 		return errors;
 	}
 	if (!input || typeof input !== "object" || Array.isArray(input)) {
@@ -232,7 +233,11 @@ export function validateAcceptanceInput(input: unknown, pathLabel = "acceptance"
 	} else if (value.evidence !== undefined) {
 		errors.push(`${pathLabel}.evidence must be an array. ${ACCEPTANCE_EVIDENCE_HELP}`);
 	}
-	if (value.verify !== undefined && !Array.isArray(value.verify)) errors.push(`${pathLabel}.verify must be an array.`);
+	if (value.level === "verified" && (!Array.isArray(value.verify) || value.verify.length === 0)) {
+		errors.push(`${pathLabel}.verify must contain at least one command when level is verified.`);
+	} else if (value.verify !== undefined && !Array.isArray(value.verify)) {
+		errors.push(`${pathLabel}.verify must be an array.`);
+	}
 	if (Array.isArray(value.verify)) {
 		for (const [index, command] of value.verify.entries()) {
 			if (!command || typeof command !== "object" || Array.isArray(command)) {
@@ -311,7 +316,7 @@ export function validateExecutionAcceptance(input: {
 }
 
 function normalizeCriteria(criteria: Array<string | { id?: string; must?: string; evidence?: AcceptanceEvidenceKind[]; severity?: "required" | "recommended" }> | undefined, evidence: AcceptanceEvidenceKind[]): ResolvedAcceptanceGate[] {
-	return (criteria ?? []).map((criterion, index) => {
+	return (criteria ?? []).map((criterion, index): ResolvedAcceptanceGate => {
 		if (typeof criterion === "string") {
 			return { id: `criterion-${index + 1}`, must: criterion, evidence, severity: "required" };
 		}
@@ -405,7 +410,7 @@ export function formatAcceptancePrompt(acceptance: ResolvedAcceptanceConfig, opt
 		lines.push("", "Runtime verification commands configured by parent:");
 		for (const command of acceptance.verify) lines.push(`- ${command.id}: ${command.command}`);
 	}
-	if (acceptance.review && acceptance.review !== false) {
+	if (acceptance.review) {
 		lines.push("", `Review gate: ${acceptance.review.required === false ? "optional" : "required"}${acceptance.review.agent ? ` by ${acceptance.review.agent}` : ""}.`);
 		if (acceptance.review.focus) lines.push(`Review focus: ${acceptance.review.focus}`);
 	}
@@ -650,6 +655,21 @@ function parseAcceptanceReportBody(body: string): { report?: AcceptanceReport; e
 	return validateAcceptanceReport(parseReportJson(body));
 }
 
+function parseUnterminatedAcceptanceReportFence(output: string): { report?: AcceptanceReport; error?: string } {
+	const opener = /```acceptance[-_]report\b[^\n]*\n/gi.exec(output);
+	if (!opener) return {};
+	const bodyStart = opener.index + opener[0].length;
+	if (output.indexOf("```", bodyStart) !== -1) return {};
+	try {
+		const validation = validateAcceptanceReport(JSON.parse(output.slice(bodyStart).trim()) as unknown);
+		return validation.report
+			? { report: validation.report }
+			: { error: `Failed to parse acceptance-report: Invalid acceptance-report: ${validation.errors.join("; ")}` };
+	} catch (error) {
+		return { error: `Failed to parse acceptance-report: ${error instanceof Error ? error.message : String(error)}` };
+	}
+}
+
 function parseGenericJsonAcceptanceReportBody(body: string): { report?: AcceptanceReport; error?: string } {
 	const parsed = parseReportJson(body);
 	const normalized = normalizeAcceptanceReportValue(parsed);
@@ -681,6 +701,8 @@ export function parseAcceptanceReport(output: string): { report?: AcceptanceRepo
 	}
 	if (parseErrors.length > 0) return { error: `Failed to parse acceptance-report: ${parseErrors.join("; ")}` };
 	if (explicitFencePresent) {
+		const recovered = parseUnterminatedAcceptanceReportFence(output);
+		if (recovered.report || recovered.error) return recovered;
 		return { error: "Failed to parse acceptance-report: Empty or unterminated acceptance-report fence." };
 	}
 	for (const body of fencedBlocks(output, "(?:json|jsonc|json5)")) {
@@ -942,7 +964,7 @@ function uniqueStrings(items: Array<string | undefined>): string[] {
 }
 
 export function aggregateAcceptanceReport(input: {
-	results: Array<Pick<SingleResult, "agent" | "acceptance" | "error" | "exitCode">>;
+	results: Array<Pick<SingleResult, "agent" | "acceptance" | "error"> & { exitCode: number | null }>;
 	notes?: string;
 }): AcceptanceReport {
 	const childReports = input.results.map((result) => result.acceptance?.childReport).filter((report): report is AcceptanceReport => Boolean(report));
@@ -952,7 +974,7 @@ export function aggregateAcceptanceReport(input: {
 		criteriaSatisfied: [
 			{ id: "criterion-1", status: successfulChildren ? "satisfied" : "not-satisfied", evidence: successfulChildren ? `All ${input.results.length} dynamic child run(s) completed without child or acceptance blockers.` : "Dynamic fanout produced no accepted child evidence." },
 			{ id: "criterion-2", status: successfulChildren ? "satisfied" : "not-satisfied", evidence: successfulChildren ? "Collected child acceptance evidence for aggregate review." : "Dynamic fanout produced no aggregate review evidence." },
-			...input.results.map((result, index) => ({
+			...input.results.map((result, index): { id?: string; status: "satisfied" | "not-satisfied" | "not-applicable"; evidence: string } => ({
 				id: `child-${index + 1}`,
 				status: result.exitCode === 0 && result.acceptance?.status !== "rejected" ? "satisfied" : "not-satisfied",
 				evidence: `${result.agent}: acceptance ${result.acceptance?.status ?? "unreported"}${result.error ? ` (${result.error})` : ""}`,
@@ -1148,7 +1170,7 @@ export async function evaluateAcceptance(input: {
 		ledger.evidenceStatus = ledger.status;
 	}
 
-	if (acceptance.review && acceptance.review !== false) {
+	if (acceptance.review) {
 		if (input.reviewResult?.status === "reviewed") {
 			ledger.reviewResult = input.reviewResult;
 			ledger.status = "reviewed";

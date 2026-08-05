@@ -9,6 +9,7 @@ import { WAIT_TOOL_ENABLED_ENV } from "../../src/runs/background/wait-config.ts"
 import { PI_CODING_AGENT_PACKAGE_ROOT_ENV } from "../../src/shared/utils.ts";
 import { CHILD_TOOL_DIAGNOSTIC_PATH_ENV, MCP_DIRECT_CHILD_TOOLS_ENV, REQUIRED_CHILD_TOOLS_ENV } from "../../src/runs/shared/tool-availability.ts";
 import { CHILD_WATCHDOG_CONFIG_ENV } from "../../src/watchdog/child-status.ts";
+import { PERMISSION_AUDIT_PATH_ENV, PERMISSION_POLICY_ENV } from "../../src/runs/shared/permissions.ts";
 import {
 	SUBAGENT_FANOUT_CHILD_ENV,
 	SUBAGENT_PARENT_CHILD_INDEX_ENV,
@@ -27,6 +28,8 @@ import {
 	PI_INTERCOM_SESSION_ID_ENV,
 	applyThinkingSuffix,
 	buildPiArgs,
+	projectLaunchResolvedChildExtensions,
+	resolvePiLaunchToolPlan,
 } from "../../src/runs/shared/pi-args.ts";
 
 const originalEnv = {
@@ -132,6 +135,29 @@ afterEach(() => {
 });
 
 describe("buildPiArgs session wiring", () => {
+	it("projects launch-resolved extension identifiers without raw paths", () => {
+		const privateExt = path.join(os.tmpdir(), "private-extension-root", "secret-extension.ts");
+		const toolExt = path.join(os.tmpdir(), "tool-extension-root", "tool-extension.ts");
+		const plan = resolvePiLaunchToolPlan({
+			tools: ["read", toolExt],
+			extensions: [privateExt],
+			subagentOnlyExtensions: ["package-extension"],
+		});
+
+		const projection = projectLaunchResolvedChildExtensions(plan);
+
+		assert.equal(projection.version, 1);
+		assert.equal(projection.source, "launch-resolved");
+		assert.equal(projection.disableAmbientExtensions, true);
+		assert.equal(projection.runtime.length, 1);
+		assert.equal(projection.configured.length, 3);
+		assert.equal(projection.effective.length, 4);
+		for (const id of [...projection.runtime, ...projection.configured, ...projection.effective]) {
+			assert.match(id, /^sha256:[a-f0-9]{16}$/);
+		}
+		assert.ok(!JSON.stringify(projection).includes(os.tmpdir()), "projection should not expose raw extension paths");
+	});
+
 	it("uses --session when sessionFile is provided", () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-args-session-"));
 		try {
@@ -535,6 +561,26 @@ describe("buildPiArgs system prompt mode wiring", () => {
 
 		assert.equal(env[PI_INTERCOM_STABLE_ID_ENV], undefined);
 		assert.equal(env[PI_INTERCOM_SESSION_ID_ENV], undefined);
+	});
+
+	it("creates a private permission audit path without enabling the supervisor channel", () => {
+		const { env, tempDir } = buildPiArgs({
+			baseArgs: ["-p"],
+			task: "hello",
+			sessionEnabled: false,
+			inheritProjectContext: true,
+			inheritSkills: true,
+			parentSessionId: "session-parent-123",
+			runId: "permission-run",
+			childAgentName: "worker",
+			childIndex: 3,
+			permissionRules: { write: "ask" },
+		});
+
+		assert.equal(env.PI_SUBAGENT_ORCHESTRATOR_TARGET, undefined);
+		assert.equal(env[PERMISSION_POLICY_ENV], JSON.stringify({ write: "ask" }));
+		assert.equal(env[SUBAGENT_SUPERVISOR_CHANNEL_DIR_ENV], undefined);
+		assert.equal(env[PERMISSION_AUDIT_PATH_ENV], path.join(tempDir!, "permission-audit.jsonl"));
 	});
 
 	it("does not create a supervisor channel without an exact parent session id", () => {

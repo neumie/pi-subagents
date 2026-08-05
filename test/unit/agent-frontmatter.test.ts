@@ -136,6 +136,49 @@ body`);
 	});
 });
 
+describe("agent runner frontmatter", () => {
+	it("parses and serializes an external-cli runner", () => withTempHome(() => {
+		const project = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-runner-agent-"));
+		tempDirs.push(project);
+		writeAgent(path.join(project, ".pi", "agents", "external.md"), `---
+name: external
+ description: External runner
+runner:
+  type: external-cli
+  command: ${JSON.stringify(process.execPath)}
+  args: ["-e", "process.stdin.pipe(process.stdout)"]
+  promptDelivery: stdin
+async: true
+---
+Review carefully.`.replace(" description:", "description:"));
+
+		const external = discoverAgents(project, "project").agents.find((agent) => agent.name === "external")!;
+		assert.deepEqual(external.runner, { type: "external-cli", command: process.execPath, args: ["-e", "process.stdin.pipe(process.stdout)"], promptDelivery: "stdin" });
+		assert.match(serializeAgent(external), /runner:\n  type: external-cli\n  command:/);
+		assert.deepEqual(discoverAgents(project, "project").agents.find((agent) => agent.name === "external")?.runner, external.runner);
+	}));
+
+	it("rejects invalid and Pi-only external runner fields", () => withTempHome(() => {
+		const invalidCases = [
+			"type: unknown\n  command: node",
+			"type: external-cli\n  command: ''",
+			"type: external-cli\n  command: node\n  args: nope",
+			"type: external-cli\n  command: node\n  args: [ok, 1]",
+			"type: external-cli\n  command: node\n  promptDelivery: argv",
+		];
+		for (const [index, runner] of invalidCases.entries()) {
+			const project = fs.mkdtempSync(path.join(os.tmpdir(), `pi-subagents-invalid-runner-${index}-`));
+			tempDirs.push(project);
+			writeAgent(path.join(project, ".pi", "agents", "external.md"), `---\nname: external\ndescription: External\nrunner:\n  ${runner}\n---\nBody`);
+			assert.throws(() => discoverAgents(project, "project"), /invalid runner\.type|non-empty command|args must be an array of strings|promptDelivery must be 'stdin'/);
+		}
+		const project = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-runner-pi-only-"));
+		tempDirs.push(project);
+		writeAgent(path.join(project, ".pi", "agents", "external.md"), `---\nname: external\ndescription: External\nrunner:\n  type: external-cli\n  command: node\nmodel: provider/model\n---\nBody`);
+		assert.throws(() => discoverAgents(project, "project"), /unsupported Pi-only fields: model/);
+	}));
+});
+
 describe("agent skillPath frontmatter", () => {
 	it("parses and serializes comma-separated paths", () => withTempHome(() => {
 		const project = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-skill-path-agent-"));
@@ -150,6 +193,47 @@ body`);
 		const worker = discoverAgents(project, "both").agents.find((agent) => agent.name === "worker")!;
 		assert.deepEqual(worker.skillPath, ["./skills", "../shared-skills"]);
 		assert.match(serializeAgent(worker), /^skillPath: \.\/skills, \.\.\/shared-skills$/m);
+	}));
+});
+
+describe("agent aliases", () => {
+	it("parses and serializes agent aliases", () => withTempHome(() => {
+		const project = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-alias-agent-"));
+		tempDirs.push(project);
+		writeAgent(path.join(project, ".pi", "agents", "worker.md"), `---
+name: worker
+description: Worker
+aliases: developer, coder, worker
+---
+body`);
+
+		const worker = discoverAgents(project, "both").agents.find((agent) => agent.name === "worker")!;
+		assert.deepEqual(worker.aliases, ["developer", "coder"]);
+		assert.match(serializeAgent(worker), /^aliases: developer, coder$/m);
+
+		const ctx = { cwd: project, modelRegistry: { getAvailable: () => [] } };
+		assert.match(handleManagementAction("list", {}, ctx).content[0]?.text ?? "", /aliases: developer, coder/);
+		assert.match(handleManagementAction("get", { agent: "developer" }, ctx).content[0]?.text ?? "", /Agent: worker/);
+	}));
+
+	it("reports management alias collisions as ambiguous", () => withTempHome(() => {
+		const project = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-alias-collision-"));
+		tempDirs.push(project);
+		writeAgent(path.join(project, ".pi", "agents", "review-agent.md"), `---
+name: review-agent
+description: Custom reviewer
+aliases: developer
+---
+body`);
+
+		const ctx = { cwd: project, modelRegistry: { getAvailable: () => [] } };
+		const getResult = handleManagementAction("get", { agent: "developer" }, ctx);
+		assert.equal(getResult.isError, true);
+		assert.match(getResult.content[0]?.text ?? "", /Ambiguous agent alias or name 'developer': review-agent, worker/);
+
+		const disableResult = handleManagementAction("disable", { agent: "developer" }, ctx);
+		assert.equal(disableResult.isError, true);
+		assert.match(disableResult.content[0]?.text ?? "", /Ambiguous agent alias 'developer': worker, review-agent|Ambiguous agent alias 'developer': review-agent, worker/);
 	}));
 });
 
@@ -246,7 +330,7 @@ Do work
 });
 
 describe("agent permission frontmatter", () => {
-	it("preserves nested permission YAML blocks through discovery and serialization", () => {
+	it("parses and preserves explicit non-bash permission rules", () => {
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-agent-permission-frontmatter-"));
 		tempDirs.push(dir);
 		const agentsDir = path.join(dir, ".pi", "agents");
@@ -256,26 +340,30 @@ name: worker
 description: Worker
 tools: bash,read,write
 permission:
-  "*": ask
   read: allow
-  bash:
-    "*": ask
-    "git *": allow
+  write: ask
+  edit: deny
 ---
 
 Do work
 `, "utf-8");
 
-		const result = discoverAgents(dir, "project");
-		const worker = result.agents.find((agent) => agent.name === "worker");
-		assert.equal(worker?.extraFields?.permission, `"*": ask
-read: allow
-bash:
-  "*": ask
-  "git *": allow`);
+		const worker = discoverAgents(dir, "project").agents.find((agent) => agent.name === "worker");
+		assert.deepEqual(worker?.permissions, { read: "allow", write: "ask", edit: "deny" });
+		assert.equal(worker?.extraFields?.permission, undefined);
+		assert.match(serializeAgent(worker!), /^permissions:\n  read: allow\n  write: ask\n  edit: deny$/m);
+	});
 
-		const serialized = serializeAgent(worker!);
-		assert.match(serialized, /^permission:\n  "\*": ask\n  read: allow\n  bash:\n    "\*": ask\n    "git \*": allow$/m);
+	it("rejects bash permission rules and conflicting aliases", () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-agent-permission-invalid-"));
+		tempDirs.push(dir);
+		const agentsDir = path.join(dir, ".pi", "agents");
+		fs.mkdirSync(agentsDir, { recursive: true });
+		fs.writeFileSync(path.join(agentsDir, "worker.md"), `---\nname: worker\ndescription: Worker\npermission:\n  bash: deny\n---\n`, "utf-8");
+		assert.throws(() => discoverAgents(dir, "project"), /pi-guard/);
+
+		fs.writeFileSync(path.join(agentsDir, "worker.md"), `---\nname: worker\ndescription: Worker\npermission:\n  write: ask\npermissions:\n  edit: deny\n---\n`, "utf-8");
+		assert.throws(() => discoverAgents(dir, "project"), /cannot declare both permission and permissions/);
 	});
 });
 
@@ -316,15 +404,17 @@ Do work
 		assert.equal(worker?.defaultContext, "fork");
 	});
 
-	it("loads packaged planner, worker, oracle, and advisor with fork defaultContext", () => {
+	it("loads packaged planner, worker, and oracle with fork defaultContext and advisor alias", () => {
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-builtin-default-context-"));
 		tempDirs.push(dir);
 		const agents = discoverAgentsAll(dir).builtin;
 
-		for (const name of ["planner", "worker", "oracle", "advisor"]) {
+		for (const name of ["planner", "worker", "oracle"]) {
 			const agent = agents.find((candidate) => candidate.name === name);
 			assert.equal(agent?.defaultContext, "fork", `${name} should default to fork context`);
 		}
+		const oracle = agents.find((candidate) => candidate.name === "oracle");
+		assert.deepEqual(oracle?.aliases, ["advisor"]);
 	});
 });
 
@@ -601,6 +691,72 @@ Review nested project work.
 		assert.ok(agent);
 		assert.equal(agent.source, "package");
 		assert.equal(agent.filePath, path.join(packageRoot, "agents", "reviewer.md"));
+	}));
+
+	it("keeps nearest project root discovery by default when a nested .pi exists", () => withTempHome(() => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-nearest-root-default-"));
+		tempDirs.push(dir);
+		const nested = path.join(dir, "packages", "app", "src");
+		const nestedConfigDir = path.join(dir, "packages", "app", ".pi");
+		const packageRoot = path.join(dir, ".pi", "npm", "node_modules", "outer-workflow");
+		fs.mkdirSync(nested, { recursive: true });
+		fs.mkdirSync(nestedConfigDir, { recursive: true });
+		fs.mkdirSync(path.join(dir, ".git"), { recursive: true });
+		writeJson(path.join(packageRoot, "package.json"), {
+			name: "outer-workflow",
+			"pi-subagents": { agents: ["./agents"] },
+		});
+		writeAgent(path.join(packageRoot, "agents", "planner.md"), `---
+name: planner
+package: outer-workflow
+description: Plan from the outer project package.
+---
+
+Plan outer project work.
+`);
+
+		const agent = discoverAgents(nested, "both").agents.find((candidate) => candidate.name === "outer-workflow.planner");
+		assert.equal(agent, undefined);
+	}));
+
+	it("can resolve project packages and overrides from the git root", () => withTempHome(() => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-git-root-resolution-"));
+		tempDirs.push(dir);
+		const nested = path.join(dir, "packages", "app", "src");
+		const nestedConfigDir = path.join(dir, "packages", "app", ".pi");
+		const packageRoot = path.join(dir, ".pi", "npm", "node_modules", "outer-workflow");
+		fs.mkdirSync(nested, { recursive: true });
+		fs.mkdirSync(nestedConfigDir, { recursive: true });
+		fs.writeFileSync(path.join(dir, ".git"), "gitdir: ../.git/worktrees/app\n", "utf-8");
+		writeJson(path.join(dir, ".pi", "settings.json"), {
+			subagents: {
+				projectRootResolution: "git-root",
+				agentOverrides: {
+					reviewer: { model: "openai/gpt-5.4" },
+				},
+			},
+		});
+		writeJson(path.join(packageRoot, "package.json"), {
+			name: "outer-workflow",
+			"pi-subagents": { agents: ["./agents"] },
+		});
+		writeAgent(path.join(packageRoot, "agents", "planner.md"), `---
+name: planner
+package: outer-workflow
+description: Plan from the outer project package.
+---
+
+Plan outer project work.
+`);
+
+		const agents = discoverAgents(nested, "both").agents;
+		const packageAgent = agents.find((candidate) => candidate.name === "outer-workflow.planner");
+		assert.ok(packageAgent);
+		assert.equal(packageAgent.source, "package");
+		assert.equal(packageAgent.filePath, path.join(packageRoot, "agents", "planner.md"));
+		const reviewer = agents.find((candidate) => candidate.name === "reviewer");
+		assert.equal(reviewer?.model, "openai/gpt-5.4");
+		assert.equal(reviewer?.override?.path, path.join(dir, ".pi", "settings.json"));
 	}));
 
 	it("does not register legacy skill files from broad package agent roots", () => withTempHome(() => {

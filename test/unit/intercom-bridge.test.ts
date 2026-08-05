@@ -98,7 +98,7 @@ describe("resolveIntercomBridge", () => {
 		});
 
 		assert.equal(bridge.active, true);
-		assert.equal(bridge.resultDelivery, true);
+		assert.equal(bridge.resultDelivery, false);
 		assert.equal(bridge.orchestratorTarget, "main");
 		assert.equal(bridge.extensionDir, NATIVE_INTERCOM_EXTENSION_DIR);
 	});

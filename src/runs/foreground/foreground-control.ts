@@ -4,7 +4,10 @@ interface BeginForegroundChildInput {
 	index: number;
 	agent: string;
 	description?: string;
+	model?: string;
+	thinking?: string;
 	interrupt: () => boolean;
+	detach?: () => boolean;
 }
 
 function copyProgress(target: ForegroundChildControl, progress: AgentProgress | undefined): void {
@@ -40,6 +43,7 @@ function syncCurrentChild(control: ForegroundRunControl, child: ForegroundChildC
 	control.thinking = child.thinking;
 	control.toolCount = child.toolCount;
 	control.interrupt = child.interrupt;
+	control.detach = child.detach;
 	control.updatedAt = child.updatedAt;
 }
 
@@ -59,6 +63,21 @@ function clearCurrentChild(control: ForegroundRunControl): void {
 	control.thinking = undefined;
 	control.toolCount = undefined;
 	control.interrupt = undefined;
+	control.detach = undefined;
+}
+
+export function retainForegroundSchedulingOwner(control: ForegroundRunControl): void {
+	control.schedulingOwners = (control.schedulingOwners ?? 0) + 1;
+	control.updatedAt = Date.now();
+}
+
+export function settleForegroundSchedulingOwner(control: ForegroundRunControl): void {
+	control.schedulingOwners = Math.max(0, (control.schedulingOwners ?? 0) - 1);
+	control.updatedAt = Date.now();
+}
+
+export function foregroundSchedulingSettled(control: ForegroundRunControl): boolean {
+	return (control.schedulingOwners ?? 0) === 0;
 }
 
 export function beginForegroundChild(control: ForegroundRunControl, input: BeginForegroundChildInput): void {
@@ -69,6 +88,8 @@ export function beginForegroundChild(control: ForegroundRunControl, input: Begin
 		...(input.description ? { description: input.description } : {}),
 		startedAt: now,
 		updatedAt: now,
+		...(input.model ? { model: input.model } : {}),
+		...(input.thinking ? { thinking: input.thinking } : {}),
 	};
 	child.interrupt = () => {
 		if (!input.interrupt()) return false;
@@ -77,6 +98,15 @@ export function beginForegroundChild(control: ForegroundRunControl, input: Begin
 		syncCurrentChild(control, child);
 		return true;
 	};
+	if (input.detach) {
+		child.detach = () => {
+			if (!input.detach?.()) return false;
+			child.currentActivityState = undefined;
+			child.updatedAt = Date.now();
+			syncCurrentChild(control, child);
+			return true;
+		};
+	}
 	control.activeChildren ??= new Map();
 	control.activeChildren.set(input.index, child);
 	syncCurrentChild(control, child);

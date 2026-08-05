@@ -11,15 +11,14 @@ import {
 	type AsyncJobStep,
 	type Details,
 	type SubagentState,
-	ASYNC_DIR,
-	RESULTS_DIR,
+	DIRS,
 	SUBAGENT_ASYNC_COMPLETE_EVENT,
 	SUBAGENT_PROCESS_TERMINAL_EVENT,
 	SUBAGENT_LIFECYCLE_ARTIFACT_VERSION,
 } from "../shared/types.ts";
 import { readStatus } from "../shared/utils.ts";
 import { SubagentParams } from "./schemas.ts";
-import { validateChainInput } from "./chain-validation.ts";
+import { formatWorkflowJsonPreview } from "../workflows/scripted-workflow.ts";
 
 export const SUBAGENT_RPC_PROTOCOL_VERSION = 1;
 export const SUBAGENT_RPC_REQUEST_EVENT = "subagents:rpc:v1:request";
@@ -193,6 +192,17 @@ function buildFleetStatus(
 	for (const job of state.asyncJobs.values()) {
 		if (job.sessionId !== authoritativeSessionId || !activeState(job.status)) continue;
 		const startedAt = job.startedAt ?? job.updatedAt;
+		if (job.mode === "workflow") {
+			const latestEmit = job.workflow?.emits?.length ? formatWorkflowJsonPreview(job.workflow.emits.at(-1), 120) : undefined;
+			addCandidate({
+				internalKey: `async:${job.asyncId}`,
+				agent: "workflow",
+				startedAt,
+				tokens: job.totalTokens,
+				goal: latestEmit !== undefined ? `latest emit: ${latestEmit}` : job.description,
+			});
+			continue;
+		}
 		const steps: AsyncJobStep[] | undefined = job.steps?.length
 			? job.steps
 			: job.agents?.map((agent, index) => ({
@@ -318,13 +328,6 @@ function assertRecordParams(params: unknown, method: SubagentRpcMethod): Record<
 }
 
 function assertSubagentParams(params: SubagentParamsLike, label: string): void {
-	// Friendly chain validation first: name the disallowed property, list allowed
-	// ones, and show a valid example instead of raw TypeBox diagnostics.
-	try {
-		validateChainInput(params);
-	} catch (error) {
-		throw new SubagentRpcError("invalid_params", `${label}: ${error instanceof Error ? error.message : String(error)}`);
-	}
 	if (subagentParamsValidator.Check(params)) return;
 	const messages = [...subagentParamsValidator.Errors(params)]
 		.slice(0, 4)
@@ -386,6 +389,8 @@ function pingData(ctx: ExtensionContext | null) {
 			interrupt: true,
 			stop: true,
 			resume: true,
+			launchResolvedExtensions: { version: 1, source: "launch-resolved" },
+			runtimeAcknowledgedExtensions: { version: 1, source: "child-runtime", event: "subagent:acknowledge-extension" },
 			processTerminalProof: { version: 1, lifecycleArtifactVersion: SUBAGENT_LIFECYCLE_ARTIFACT_VERSION },
 		},
 		events: {
@@ -415,6 +420,9 @@ async function executeChecked(
 
 function spawnParams(params: unknown): SubagentParamsLike {
 	const input = assertRecordParams(params, "spawn");
+	if (input.tasks !== undefined || input.chain !== undefined || input.concurrency !== undefined || input.chainDir !== undefined || (input.worktree !== undefined && !(input.worktree === true && input.agent))) {
+		throw new SubagentRpcError("invalid_params", "RPC spawn no longer accepts top-level chain or parallel inputs; use workflowScript.");
+	}
 	if (input.action !== undefined) {
 		throw new SubagentRpcError("invalid_params", "RPC spawn does not accept management/control actions. Use status or interrupt RPC methods instead.");
 	}
@@ -466,8 +474,8 @@ function stopAsyncRun(
 ): { runId: string; asyncDir: string; previousState: string; state: "stopping"; message: string } {
 	const target = normalizeTargetParams(params, "stop");
 	assertSubagentParams({ action: "status", ...target }, "RPC stop target params");
-	const asyncDirRoot = options.asyncDirRoot ?? ASYNC_DIR;
-	const resultsDir = options.resultsDir ?? RESULTS_DIR;
+	const asyncDirRoot = options.asyncDirRoot ?? DIRS.async;
+	const resultsDir = options.resultsDir ?? DIRS.results;
 	let location;
 	try {
 		location = resolveAsyncRunLocation(target, asyncDirRoot, resultsDir);
