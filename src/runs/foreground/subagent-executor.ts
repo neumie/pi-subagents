@@ -272,7 +272,7 @@ export interface SubagentParamsLike {
 	workflowKey?: string;
 	workflowChildAsyncId?: string;
 	suppressRoutineResultIntercom?: boolean;
-	/** Internal durable-run compatibility fields. Public callers must use workflowScript. */
+	/** Compatibility execution fields used by normalized public calls and durable internal runs. */
 	chain?: ChainStep[];
 	tasks?: TaskParam[];
 	concurrency?: number;

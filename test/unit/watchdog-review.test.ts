@@ -59,6 +59,7 @@ function createCtx(input: {
 	models?: Model<any>[];
 	authenticated?: string[];
 	thinkingLevel?: string;
+	authHeaders?: Record<string, string | null>;
 	providerConfig?: { provider: string; api: string; streamSimple: StreamFn };
 }) {
 	const allModels = input.models ?? (input.current ? [input.current] : []);
@@ -74,7 +75,7 @@ function createCtx(input: {
 			find: (provider: string, id: string) => allModels.find((entry) => entry.provider === provider && entry.id === id),
 			hasConfiguredAuth: (entry: Model<any>) => authenticated.has(`${entry.provider}/${entry.id}`),
 			getApiKeyAndHeaders: async (entry: Model<any>) => authenticated.has(`${entry.provider}/${entry.id}`)
-				? { ok: true as const, apiKey: `key-${entry.provider}-${entry.id}`, headers: { "x-model": entry.id }, env: { WATCHDOG_PROVIDER: entry.provider } }
+				? { ok: true as const, apiKey: `key-${entry.provider}-${entry.id}`, headers: input.authHeaders ?? { "x-model": entry.id }, env: { WATCHDOG_PROVIDER: entry.provider } }
 				: { ok: false as const, error: `No auth for ${entry.provider}/${entry.id}` },
 			getRegisteredProviderConfig: (provider: string) => input.providerConfig?.provider === provider ? input.providerConfig : undefined,
 		},
@@ -281,7 +282,11 @@ describe("main watchdog review adapter", () => {
 	it("uses the registered stream for matching custom providers", async () => {
 		const current = model("custom-provider", "watchdog", { api: "custom-api" });
 		const { streamFn, calls } = createStreamFn([fauxAssistantMessage("clean", { stopReason: "stop" })]);
-		const ctx = createCtx({ current, providerConfig: { provider: current.provider, api: "custom-api", streamSimple: streamFn } });
+		const ctx = createCtx({
+			current,
+			authHeaders: { "x-model": "watchdog", "x-remove-default": null },
+			providerConfig: { provider: current.provider, api: "custom-api", streamSimple: streamFn },
+		});
 		const warnings: WatchdogWarning[] = [];
 
 		const result = await createMainWatchdogReview(ctx)(request(enabledConfig(), warnings));
@@ -291,6 +296,7 @@ describe("main watchdog review adapter", () => {
 		assert.equal(calls[0]?.model, current);
 		assert.equal(calls[0]?.options?.apiKey, "key-custom-provider-watchdog");
 		assert.equal(calls[0]?.options?.headers?.["x-model"], "watchdog");
+		assert.equal(calls[0]?.options?.headers?.["x-remove-default"], null);
 		assert.deepEqual(calls[0]?.options?.env, { WATCHDOG_PROVIDER: "custom-provider" });
 	});
 

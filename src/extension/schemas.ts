@@ -255,11 +255,15 @@ const ControlOverrides = Type.Object({
 });
 
 const SubagentParamsSchema = Type.Object({
-	agent: Type.Optional(Type.String({ description: "Agent target for management actions such as get, update, delete, and models." })),
+	agent: Type.Optional(Type.String({ description: "Agent name for direct single execution, or target for management actions such as get, update, delete, and models." })),
+	task: Type.Optional(Type.String({ description: "Task for direct single execution, or the original request supplied to chain templates; optional only for a self-contained direct agent or a chain whose first step has its own task." })),
+	tasks: Type.Optional(Type.Array(ParallelTaskSchema, { minItems: 1, maxItems: 8, description: "Compatibility parallel execution. Prefer workflowScript for composed multi-agent work." })),
+	chain: Type.Optional(Type.Array(ChainItem, { minItems: 1, maxItems: 8, description: "Compatibility chain execution. Prefer workflowScript for new composed workflows." })),
+	concurrency: Type.Optional(Type.Integer({ minimum: 1, maximum: 8, description: "Maximum concurrent top-level tasks." })),
 	resume: Type.Optional(Type.String({ description: "Retained child run id for a workflowScript runs.run/runs.all item. Mutually exclusive with agent; task supplies the follow-up." })),
 	// Management action (when present, tool operates in management mode)
 	action: Type.Optional(Type.String({ minLength: 1,
-		description: "Optional management/control action. Omit this field for workflowScript execution; use it only for management/control actions."
+		description: "Optional management/control action. Omit this field for direct or workflowScript execution; use it only for management/control actions."
 	})),
 	name: Type.Optional(Type.String({ description: "Human-readable name for action='schedule.create'." })),
 	id: Type.Optional(Type.String({
@@ -317,15 +321,15 @@ const SubagentParamsSchema = Type.Object({
 	})),
 	workflowScript: Type.Optional(Type.String({ minLength: 1, description: "Trusted inline JavaScript statement body. Starts async by default; pass async:false for a small foreground run. Use explicit return for output. Use await runs.run(key, {agent, task, worktree?, gate?}) or runs.run(key, {resume, task}), runs.all([...]), runs.status(id), runs.ref(s), emit(value), console, and return. Mission workflows also have async state.get(key) and state.set(key, JSONValue). Use ordinary JavaScript loops, branches, awaits, and arrays to mix sequential and parallel phases dynamically. Set worktree:true at workflow or child level for a separate managed worktree; child fields override workflow defaults. gate is one host-run command and cannot be combined with acceptance. runs.run accepts one child only. No filesystem, shell, Pi tools, or host globals." })),
 	chatProgress: Type.Optional(Type.String({ enum: ["auto", "off", "live-card"], description: "WorkflowScript chat progress projection. auto shows a live in-chat card only for watched foreground workflows in the same Git repository; it is off otherwise." })),
-	worktree: Type.Optional(Type.Boolean({ description: "Managed child isolation. true gives each workflow child a separate git worktree; an individual runs.run/runs.all item can override a workflow default with worktree:false." })),
+	worktree: Type.Optional(Type.Boolean({ description: "Managed child isolation. true gives a direct child or each workflow child a separate git worktree; an individual runs.run/runs.all item can override a workflow default with worktree:false." })),
 	step: Type.Optional(Type.Unsafe({ ...ChainItem, description: "One chain step for action='append-step' only. Not an execution mode." })),
 	context: Type.Optional(Type.String({
 		enum: ["fresh", "fork"],
 		description: "'fresh' or 'fork' to branch from parent session. Explicit context overrides every child in the invocation. If omitted, each requested agent uses its own defaultContext; agents without defaultContext: 'fork' run fresh.",
 	})),
-	async: Type.Optional(Type.Boolean({ description: "Run in background (default: false, or per config)" })),
-	timeoutMs: Type.Optional(Type.Integer({ minimum: 1, description: "Optional timeout for foreground and async/background runs. Foreground workflows default to 30m; async workflows have no default timeout. Alias maxRuntimeMs." })),
-	maxRuntimeMs: Type.Optional(Type.Integer({ minimum: 1, description: "Alias timeoutMs for foreground and async/background runs. Foreground workflows default to 30m; async workflows have no default timeout." })),
+	async: Type.Optional(Type.Boolean({ description: "Run in background. Defaults to true unless agent or package configuration opts out; pass false for foreground execution." })),
+	timeoutMs: Type.Optional(Type.Integer({ minimum: 1, description: "Optional timeout for foreground and async/background runs. Foreground execution defaults to 30m; async workflows have no default timeout. Alias maxRuntimeMs." })),
+	maxRuntimeMs: Type.Optional(Type.Integer({ minimum: 1, description: "Alias timeoutMs for foreground and async/background runs. Foreground execution defaults to 30m; async workflows have no default timeout." })),
 	turnBudget: Type.Optional(TurnBudgetOverride),
 	toolBudget: Type.Optional(ToolBudgetOverride),
 	usageBudget: Type.Optional(UsageBudgetOverride),
@@ -337,6 +341,7 @@ const SubagentParamsSchema = Type.Object({
 	sessionDir: Type.Optional(
 		Type.String({ description: "Directory to store session logs (default: temp; enables sessions even if share=false)" }),
 	),
+	clarify: Type.Optional(Type.Boolean({ description: "Direct execution may use the clarify UI. workflowScript accepts clarify:false for compatibility but rejects clarify:true." })),
 	control: Type.Optional(ControlOverrides),
 	// Workflow defaults forwarded to each runs.run/runs.all child unless overridden there.
 	output: Type.Optional(Type.Unsafe({
@@ -344,11 +349,11 @@ const SubagentParamsSchema = Type.Object({
 			{ type: "string" },
 			{ type: "boolean" },
 		],
-		description: "Default child output file (string), or false to disable. Relative paths resolve against cwd.",
+		description: "Output file for direct execution or default workflow child output (string), or false to disable. Relative paths resolve against cwd.",
 	})),
 	outputMode: Type.Optional(OutputModeOverride),
 	skill: Type.Optional(SkillOverride),
-	model: Type.Optional(Type.String({ description: "Default child model override (e.g. 'anthropic/claude-sonnet-4')" })),
+	model: Type.Optional(Type.String({ description: "Direct child or default workflow model override (e.g. 'anthropic/claude-sonnet-4')" })),
 	outputSchema: Type.Optional(JsonSchemaObject),
 	agentContract: Type.Optional(AgentContractOverride),
 	acceptance: Type.Optional(AcceptanceOverride),

@@ -99,7 +99,7 @@ export function createWatchdogPermissionArbiter(options: WatchdogPermissionArbit
 				env: auth.env || streamOptions?.env ? { ...(auth.env ?? {}), ...(streamOptions?.env ?? {}) } : undefined,
 				headers: { ...(streamOptions?.headers ?? {}), ...(auth.headers ?? {}) },
 			});
-			agent = new Agent({
+			const agentOptions = {
 				initialState: {
 					systemPrompt: [
 						"You are the pi-subagents watchdog permission arbiter.",
@@ -112,11 +112,14 @@ export function createWatchdogPermissionArbiter(options: WatchdogPermissionArbit
 					tools: [tool],
 				},
 				convertToLlm,
+				// Keep both spellings while this fork supports Pi 0.83 and 0.84 peers.
+				streamFn,
 				streamFunction: streamFn,
-				getApiKey: (providerName) => providerName === selection.model.provider ? auth.apiKey : undefined,
-				beforeToolCall: async ({ toolCall }) => toolCall.name === tool.name ? undefined : { block: true, reason: `Permission arbiter tool '${toolCall.name}' is not allowed.` },
-				toolExecution: "sequential",
-			});
+				getApiKey: (providerName: string) => providerName === selection.model.provider ? auth.apiKey : undefined,
+				beforeToolCall: async ({ toolCall }: { toolCall: { name: string } }) => toolCall.name === tool.name ? undefined : { block: true, reason: `Permission arbiter tool '${toolCall.name}' is not allowed.` },
+				toolExecution: "sequential" as const,
+			} as ConstructorParameters<typeof Agent>[0] & { streamFn: StreamFn; streamFunction: StreamFn };
+			agent = new Agent(agentOptions);
 			const abort = () => agent?.abort();
 			request.signal?.addEventListener("abort", abort, { once: true });
 			request.ctx.signal?.addEventListener("abort", abort, { once: true });

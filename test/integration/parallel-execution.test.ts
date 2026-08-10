@@ -351,7 +351,7 @@ describe("parallel agent execution", { skip: !piAvailable ? "pi packages not ava
 			);
 
 			assert.equal(result.isError, true);
-			assert.match(result.content[0]?.text ?? "", /Legacy top-level chain and parallel inputs were removed/);
+			assert.match(result.content[0]?.text ?? "", /Execution modes must omit action/);
 			assert.equal(mockPi.callCount(), 0);
 		}
 	});

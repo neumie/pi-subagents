@@ -36,7 +36,7 @@ type RegistryModel = Model<any>;
 
 interface WatchdogReviewAuth {
 	apiKey?: string;
-	headers?: Record<string, string>;
+	headers?: Record<string, string | null>;
 	env?: Record<string, string>;
 }
 

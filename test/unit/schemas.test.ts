@@ -184,22 +184,29 @@ describe("SubagentParams schema", { skip: !schemasAvailable ? "typebox not avail
 		assert.match(String(chatProgress?.description ?? ""), /same Git repository/i);
 		const worktree = SubagentParams?.properties?.worktree;
 		assert.equal(worktree?.type, "boolean");
-		assert.match(String(worktree?.description ?? ""), /each workflow child/i);
+		assert.match(String(worktree?.description ?? ""), /direct child or each workflow child/i);
 		const gate = SubagentParams?.properties?.gate;
 		assert.equal(gate?.type, "string");
 		assert.equal(gate?.minLength, 1);
 		assert.match(String(gate?.description ?? ""), /cannot be combined with acceptance/i);
-		const properties = SubagentParams?.properties as Record<string, unknown> | undefined;
-		assert.equal(properties?.task, undefined, "task should only exist inside workflowScript children");
-		assert.equal(properties?.clarify, undefined, "clarify should not be model-facing");
-		assert.ok(properties?.output, "output remains a workflow child default");
+		const properties = SubagentParams?.properties as Record<string, JsonSchemaNode> | undefined;
+		assert.equal(properties?.task?.type, "string", "direct execution should expose task");
+		assert.equal(properties?.clarify?.type, "boolean", "direct execution should expose clarify");
+		assert.match(String(properties?.clarify?.description ?? ""), /workflowScript accepts clarify:false/i);
+		assert.ok(properties?.output, "output remains available to direct and workflow execution");
 	});
 
-	it("removes legacy top-level orchestration parameters", () => {
-		for (const name of ["tasks", "chain", "concurrency", "chainDir"]) {
-			assert.equal((SubagentParams?.properties as Record<string, unknown> | undefined)?.[name], undefined, `${name} should not be public`);
-		}
-		const stepSchema = (SubagentParams?.properties as Record<string, JsonSchemaNode> | undefined)?.step;
+	it("exposes bounded top-level tasks and chain compatibility", () => {
+		const properties = SubagentParams?.properties as Record<string, JsonSchemaNode> | undefined;
+		assert.equal(properties?.tasks?.type, "array");
+		assert.equal(properties?.tasks?.minItems, 1);
+		assert.equal(properties?.tasks?.maxItems, 8);
+		assert.equal(properties?.chain?.type, "array");
+		assert.equal(properties?.chain?.minItems, 1);
+		assert.equal(properties?.chain?.maxItems, 8);
+		assert.equal(properties?.concurrency?.type, "integer");
+		assert.equal(properties?.chainDir, undefined, "internal chain directories should not be public");
+		const stepSchema = properties?.step;
 		assert.equal(stepSchema?.type, "object");
 		assert.match(String(stepSchema?.description ?? ""), /append-step.*only/i);
 	});
@@ -212,8 +219,7 @@ describe("SubagentParams schema", { skip: !schemasAvailable ? "typebox not avail
 		assert.equal(actionSchema.enum, undefined);
 		const description = String(actionSchema.description ?? "");
 		assert.match(description, /Optional management\/control action/);
-		assert.match(description, /Omit this field for workflowScript execution/);
-		assert.doesNotMatch(description, /\{agent, task\}/);
+		assert.match(description, /Omit this field for direct or workflowScript execution/);
 		assert.match(description, /use it only for management\/control actions/);
 		assert.doesNotMatch(description, /orchestration\./);
 	});
@@ -367,8 +373,8 @@ describe("SubagentParams schema", { skip: !schemasAvailable ? "typebox not avail
 		assert.ok(SubagentParams, "SubagentParams schema should exist");
 		const schema = SubagentParams as unknown as JsonSchemaNode;
 		const serialized = JSON.stringify(schema);
-		// Mission, inspector, inline workflow, and guide fields intentionally expanded the public tool surface.
-		assert.ok(serialized.length < 17_100, `expected compact schema under 17.1k chars, got ${serialized.length}`);
+		// Mission, inspector, inline workflow, guide, and bounded compatibility fields expand the public tool surface.
+		assert.ok(serialized.length < 25_000, `expected compact schema under 25k chars, got ${serialized.length}`);
 		assert.equal(serialized.includes('"$ref"'), false);
 		assert.equal(serialized.includes('"$defs"'), false);
 		assert.equal(serialized.split("Optional acceptance policy.").length - 1, 1);
