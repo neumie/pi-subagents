@@ -2,9 +2,11 @@
 
 ## [Unreleased]
 
+### Changed
+- Aligned the fork's public execution boundary with upstream's `workflowScript`-only API and migrated active package guidance and real-session callers off removed direct, parallel, chain, and `clarify` inputs.
+
 ### Fixed
-- Restored the fork's public direct `{ agent, task }`, bounded top-level `tasks`/`chain`, and `clarify: false` compatibility while keeping execution inputs disjoint from management actions.
-- Kept watchdog reviews and permission arbitration on their injected or registered provider stream across Pi's `Agent` stream option rename, including nullable provider headers in Pi 0.84.
+- Kept watchdog reviews and permission arbitration on their injected or registered provider streams across Pi 0.83/0.84 `Agent` option differences, including nullable provider headers.
 
 
 ### Added

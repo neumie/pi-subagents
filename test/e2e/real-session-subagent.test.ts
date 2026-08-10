@@ -48,7 +48,7 @@ describe("real Pi-session subagent E2E", { skip: !available ? "pi runtime packag
 		run = undefined;
 	});
 
-	it("loads requested extension tools in direct and workflow children and diagnoses missing providers", async () => {
+	it("loads requested extension tools in single and parallel workflow children and diagnoses missing providers", async () => {
 		const { runRealSubagentSession, subagentCall, subagentToolResults } = await import("../support/real-session-runner.ts");
 		const extensionAgent = `---
 name: extension-worker
@@ -76,7 +76,7 @@ Use the available tools.`;
 }`;
 
 		run = await runRealSubagentSession({
-			prompt: "Run the direct, workflow, and missing-provider child checks.",
+			prompt: "Run the single-workflow, parallel-workflow, and missing-provider child checks.",
 			childText: CHILD_MARKER,
 			reportChildTools: true,
 			projectFiles: {
@@ -87,7 +87,10 @@ Use the available tools.`;
 			respond(context) {
 				const resultCount = (context.messages as Array<{ role?: string; toolName?: string }>).filter((message) => message.role === "toolResult" && message.toolName === "subagent").length;
 				if (resultCount === 0) {
-					return subagentCall({ agent: "extension-worker", task: "Report active tools.", context: "fresh", async: false, clarify: false, agentScope: "project" }, "call-direct-extension");
+					return subagentCall({
+						workflowScript: "return runs.run('extension', { agent: 'extension-worker', task: 'Report active tools.', context: 'fresh', agentScope: 'project' })",
+						async: false,
+					}, "call-single-workflow-extension");
 				}
 				if (resultCount === 1) {
 					return subagentCall({
@@ -106,12 +109,14 @@ Use the available tools.`;
 							},
 						]);`,
 						async: false,
-						clarify: false,
 						agentScope: "project",
 					}, "call-workflow-extension");
 				}
 				if (resultCount === 2) {
-					return subagentCall({ agent: "missing-extension-worker", task: "Report active tools.", context: "fresh", async: false, clarify: false, agentScope: "project" }, "call-missing-extension");
+					return subagentCall({
+						workflowScript: "return runs.run('missing-extension', { agent: 'missing-extension-worker', task: 'Report active tools.', context: 'fresh', agentScope: 'project' })",
+						async: false,
+					}, "call-missing-extension");
 				}
 				return "Child tool checks complete.";
 			},
@@ -165,7 +170,10 @@ Report active tools.`;
 			respond(context) {
 				const resultCount = (context.messages as Array<{ role?: string; toolName?: string }>).filter((message) => message.role === "toolResult" && message.toolName === "subagent").length;
 				if (resultCount > 0) return "Async child tool check complete.";
-				return subagentCall({ agent: "async-extension-worker", task: "Report active tools.", context: "fresh", async: false, clarify: false, agentScope: "project" }, "call-async-extension");
+				return subagentCall({
+					workflowScript: "return runs.run('async-extension', { agent: 'async-extension-worker', task: 'Report active tools.', context: 'fresh', agentScope: 'project' })",
+					async: false,
+				}, "call-async-extension");
 			},
 			timeoutMs: 60_000,
 		});
@@ -196,12 +204,8 @@ Report active tools.`;
 				respond: routeParentThroughSubagent({
 					childMarker: CHILD_MARKER,
 					subagentArgs: {
-						agent: "worker",
-						task: "Return the marker from the faux child provider.",
-						context: "fresh",
+						workflowScript: "return runs.run('worker', { agent: 'worker', task: 'Return the marker from the faux child provider.', context: 'fresh', agentScope: 'project' })",
 						async: false,
-						clarify: false,
-						agentScope: "project",
 					},
 				}),
 			});

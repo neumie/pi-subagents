@@ -52,23 +52,24 @@ describe("slash subagent bridge requester context", () => {
     await done;
   });
 
-  it("dispatches direct execution inputs", async () => {
+  it("rejects direct execution inputs before executor dispatch", async () => {
     const events = eventBus();
-    let executedParams: any;
+    let executeCalls = 0;
     registerSlashSubagentBridge({
       events,
       getContext: () => ({ cwd: "/repo" }) as any,
-      execute: async (_id, params) => {
-        executedParams = params;
-        return { content: [{ type: "text", text: "ok" }], details: { mode: "single", results: [] } } as any;
+      execute: async () => {
+        executeCalls++;
+        return { content: [{ type: "text", text: "unexpected" }], details: { mode: "single", results: [] } } as any;
       },
     });
 
     const done = new Promise<void>((resolve, reject) => {
       events.on(RESPONSE, (data: any) => {
         try {
-          assert.equal(data.isError, false);
-          assert.deepEqual(executedParams, { agent: "worker", task: "work" });
+          assert.equal(data.isError, true);
+          assert.match(data.errorText, /Direct execution was removed/);
+          assert.equal(executeCalls, 0);
           resolve();
         } catch (error) {
           reject(error);
@@ -76,27 +77,28 @@ describe("slash subagent bridge requester context", () => {
       });
     });
 
-    events.emit(REQUEST, { requestId: "direct-single", params: { agent: "worker", task: "work" } });
+    events.emit(REQUEST, { requestId: "legacy-single", params: { agent: "worker", task: "work" } });
     await done;
   });
 
-  it("dispatches top-level task execution inputs", async () => {
+  it("rejects removed chain and parallel inputs before executor dispatch", async () => {
     const events = eventBus();
-    let executedParams: any;
+    let executeCalls = 0;
     registerSlashSubagentBridge({
       events,
       getContext: () => ({ cwd: "/repo" }) as any,
-      execute: async (_id, params) => {
-        executedParams = params;
-        return { content: [{ type: "text", text: "ok" }], details: { mode: "parallel", results: [] } } as any;
+      execute: async () => {
+        executeCalls++;
+        return { content: [{ type: "text", text: "unexpected" }], details: { mode: "single", results: [] } } as any;
       },
     });
 
     const done = new Promise<void>((resolve, reject) => {
       events.on(RESPONSE, (data: any) => {
         try {
-          assert.equal(data.isError, false);
-          assert.deepEqual(executedParams, { tasks: [{ agent: "worker", task: "work" }] });
+          assert.equal(data.isError, true);
+          assert.match(data.errorText, /removed.*workflowScript/i);
+          assert.equal(executeCalls, 0);
           resolve();
         } catch (error) {
           reject(error);
@@ -104,7 +106,7 @@ describe("slash subagent bridge requester context", () => {
       });
     });
 
-    events.emit(REQUEST, { requestId: "top-level-tasks", params: { tasks: [{ agent: "worker", task: "work" }] } });
+    events.emit(REQUEST, { requestId: "legacy-parallel", params: { tasks: [{ agent: "worker", task: "work" }] } });
     await done;
   });
 });

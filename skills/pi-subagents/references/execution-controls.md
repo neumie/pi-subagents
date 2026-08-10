@@ -30,8 +30,7 @@ External CLI profiles are async-only and one-shot. They support lifecycle artifa
 
 ```typescript
 subagent({
-  agent: "oracle",
-  task: "Review my current direction and challenge assumptions."
+  workflowScript: `return runs.run("oracle-check", { agent: "oracle", task: "Review my current direction and challenge assumptions." })`
 })
 ```
 
@@ -39,9 +38,7 @@ subagent({
 
 ```typescript
 subagent({
-  agent: "oracle",
-  task: "Review my current direction and challenge assumptions.",
-  context: "fork"
+  workflowScript: `return runs.run("oracle-check", { agent: "oracle", task: "Review my current direction and challenge assumptions.", context: "fork" })`
 })
 ```
 
@@ -56,7 +53,7 @@ its resolved launch context as `[fresh]` or `[fork]`. Aggregate headers show
 
 ### Scripted workflows
 
-`workflowScript` is the preferred public surface for composed orchestration; direct `{ agent, task }` remains the simplest public one-child form. Bounded top-level `tasks` and `chain` inputs remain accepted for compatibility, and a top-level chain may use `task` as the original request for its templates. Use `runs.run(key, { agent, task, ... })` for one child inside a script, `runs.all([...])` for parallel children, and ordinary JavaScript for sequence, branching, filtering, retries, and aggregation. Scripts are ordinary JavaScript statement bodies, so use an explicit return such as `workflowScript: "return runs.run('main', { agent: 'worker', task: '...' })"` for a useful one-child result. Prefer a single scripted workflow whenever the parent is starting a coordinated wave, such as multiple reviews, review plus gate monitor, worker then monitor setup, cross-repo prep lanes, or a fanout that the parent will consume together.
+`workflowScript` is the sole public execution surface. Use `runs.run(key, { agent, task, ... })` for one child, `runs.all([...])` for parallel children, and ordinary JavaScript for sequence, branching, filtering, retries, and aggregation. Scripts are ordinary JavaScript statement bodies, so use an explicit return such as `workflowScript: "return runs.run('main', { agent: 'worker', task: '...' })"` for a useful one-child result. Prefer a single scripted workflow whenever the parent is starting a coordinated wave, such as multiple reviews, review plus gate monitor, worker then monitor setup, cross-repo prep lanes, or a fanout that the parent will consume together.
 
 ```js
 subagent({

@@ -5,8 +5,8 @@ Parameters and actions for the `subagent` tool. These are what the LLM passes wh
 ## Execution examples
 
 ```js
-// One child
-{ agent: "scout", task: "Analyze the auth flow" }
+// One child; return the child promise explicitly
+{ workflowScript: `return runs.run("main", { agent: "scout", task: "Analyze the auth flow" })` }
 
 // Sequential workflow
 { workflowScript: `
@@ -28,16 +28,12 @@ Parameters and actions for the `subagent` tool. These are what the LLM passes wh
 
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|
-| `agent` | string | - | Agent for direct single execution, or target for management actions. Workflow child agents are set inside `runs.run` or `runs.all`. |
-| `task` | string | agent/chain-defined | Task for direct single execution, or the original request supplied to top-level chain templates. |
-| `tasks` | array | - | Bounded top-level parallel compatibility input (1–8 children). Prefer `workflowScript` for new composed work. |
-| `chain` | array | - | Bounded top-level sequential compatibility input (1–8 steps). Prefer `workflowScript` for new composed work. |
-| `concurrency` | integer | runtime default | Maximum concurrent top-level compatibility tasks (1–8). |
+| `agent` | string | - | Agent target for management actions. Workflow child agents are set inside `runs.run` or `runs.all`. |
 | `action` | string | - | Agent management (including `guide`, `children.list`, and `refine`/`refine.show`/`refine.rollback`), mission (`mission.create/list/show/update/resolve-decision/attach-run/close`), Herdr inspector (`inspector.open/status/close`), status/control, schedule, watchdog, or doctor action. |
 | `topic` | `overview \| workflows \| agents \| missions \| observability \| tool-reference \| configuration \| models \| watchdog \| extension-api` | `overview` | Packaged guide topic for `action: "guide"`. |
 | `chainName` | string | - | Chain name for management actions. |
 | `config` | object/string | - | Agent or existing durable chain config for management create/update. |
-| `context` | `fresh \| fork` | per-agent default or `fresh` | Explicit `fresh` or `fork` applies to a direct child or overrides every workflow child. When omitted, each child agent uses its own `defaultContext`; `fork` creates real branched sessions from the parent leaf. Packaged `worker`, `oracle`, and `advisor` default to `fork`. |
+| `context` | `fresh \| fork` | per-agent default or `fresh` | Explicit `fresh` or `fork` overrides every workflow child. When omitted, each child agent uses its own `defaultContext`; `fork` creates real branched sessions from the parent leaf. Packaged `worker`, `oracle`, and `advisor` default to `fork`. |
 | `missionId` | string | - | Attach a workflow to an existing project mission instead of creating its default enclosing mission. |
 | `mission` | object/false | auto-create | Override the default enclosing mission with `{ title, objective?, goal?, budget?, labels? }`; `goal: true` requires `budget.tokens` and enables continuation notices. Pass `false` for an intentionally ephemeral workflow with no mission for it or its children and no `state` global. Explicit mission persistence failures are strict. |
 | `handoffPath` | string | - | Aggregate handoff manifest required by `action: "worktree.discard"`. |
@@ -45,8 +41,7 @@ Parameters and actions for the `subagent` tool. These are what the LLM passes wh
 | `view` | `fleet \| transcript` | - | Optional `status` view for the active fleet surface or transcript tail inspection. |
 | `lines` | number | `80` | Maximum transcript lines for `action: "status", view: "transcript"`; capped at 500. |
 | `agentScope` | `user \| project \| both` | `both` | Agent discovery scope. Project wins on collisions. |
-| `async` | boolean | true unless configured otherwise | Background execution. Direct and workflow execution default to background unless agent/package configuration opts out; pass `async:false` for foreground execution. |
-| `clarify` | boolean | false | Direct execution may open the clarify UI. `workflowScript` accepts `clarify:false` for compatibility and rejects `clarify:true`; detached RPC spawn also rejects `clarify:true`. |
+| `async` | boolean | default-on | Background execution. Workflows default to background and accept `async:false` as an explicit foreground escape hatch. |
 | `chatProgress` | `auto \| off \| live-card` | `auto` | WorkflowScript chat projection. `auto` renders a live in-chat card only for watched foreground workflows in the same Git repository, including managed worktrees; it is off otherwise. Explicit `live-card` requires `async:false` and the same Git repository. |
 | `timeoutMs` / `maxRuntimeMs` | number | 30 min foreground; none async | Optional run-level max runtime in milliseconds. Foreground uses 30 minutes when omitted. Async runs have no default timeout, including async workflows. |
 | `turnBudget` | object | none | Optional assistant-turn budget `{ maxTurns, graceTurns }`. At `maxTurns` the child is warned to wrap up. After the grace window (default 1), termination occurs at the next assistant boundary; a response that starts tool work records `termination-deferred` until a later boundary. Partial output is returned on abort. |
@@ -239,18 +234,20 @@ The persisted `steering` ledger retains 20 requests and replaces the old `steerC
 
 ## Acceptance gates
 
-Every run resolves an effective acceptance policy. Callers may omit `acceptance` for the inferred default, or set it on single runs, top-level parallel task items, chain steps, static parallel tasks, and dynamic fanout templates.
+Every workflow child resolves an effective acceptance policy. Callers may omit `acceptance` for the inferred default or set it on `runs.run` children, `runs.all` items, and static or dynamic fanout templates.
 
 ```ts
 {
-  agent: "worker",
-  task: "Implement the fix",
-  acceptance: {
-    level: "verified",
-    criteria: ["Patch the bug without widening scope"],
-    evidence: ["changed-files", "tests-added", "commands-run", "residual-risks", "no-staged-files"],
-    verify: [{ id: "focused", command: "npm test", timeoutMs: 120000 }]
-  }
+  workflowScript: `return runs.run("impl", {
+    agent: "worker",
+    task: "Implement the fix",
+    acceptance: {
+      level: "verified",
+      criteria: ["Patch the bug without widening scope"],
+      evidence: ["changed-files", "tests-added", "commands-run", "residual-risks", "no-staged-files"],
+      verify: [{ id: "focused", command: "npm test", timeoutMs: 120000 }]
+    }
+  })`
 }
 ```
 

@@ -28,28 +28,26 @@ function parentToolEnv(agentDir?: string): NodeJS.ProcessEnv {
 }
 
 describe("registered subagent tool description", () => {
-	it("describes direct single delegation and workflowScript orchestration", () => {
+	it("describes workflowScript as the sole public orchestration surface", () => {
 		const description = buildSubagentToolDescription();
-		assert.match(description, /^Delegate one child with \{ agent, task \} or compose work with \{ workflowScript \}/i);
-		assert.match(description, /SINGLE:.*launches one child/i);
-		assert.match(description, /COMPATIBILITY: Top-level \{ tasks: \[\.\.\.\] \} and \{ chain: \[\.\.\.\] \} remain accepted/i);
+		assert.match(description, /^Run subagents only through \{ workflowScript \}/i);
+		assert.doesNotMatch(description, /SINGLE:|direct single child/i);
 		assert.match(description, /runs\.run for one child and runs\.all for parallel children/i);
 		assert.match(description, /repository mutation lanes.*worktree:true.*runs\.run\/runs\.all.*managed isolation/i);
 		assert.match(description, /ordinary JavaScript statement body.*explicit return/i);
 		assert.match(description, /Sequential example/i);
 		assert.match(description, /Parallel example/i);
-		assert.doesNotMatch(description, /CHAIN EXAMPLES|PARALLEL \(compatibility\)/i);
+		assert.doesNotMatch(description, /Compatibility tasks\[\]|CHAIN EXAMPLES|PARALLEL \(compatibility\)/i);
 		assert.match(description, /append-step.*step:/i);
 		assert.match(description, /cannot access filesystem, shell, arbitrary Pi tools, or host globals/i);
 		assert.match(description, /SAFETY-CRITICAL SUBAGENT GUIDANCE/);
 		assert.match(description, /status\.json/);
 	});
 
-	it("offers a compact mode that keeps direct delegation and safety guidance", () => {
+	it("offers a compact mode that keeps the cutover and safety guidance", () => {
 		const description = buildSubagentToolDescription({ toolDescriptionMode: "compact" });
 		assert.equal(description, COMPACT_SUBAGENT_TOOL_DESCRIPTION);
-		assert.match(description, /^Delegate one child with \{ agent, task \} or compose work with \{ workflowScript \}/i);
-		assert.match(description, /SINGLE .*launches one child/i);
+		assert.match(description, /^Run subagents only through \{ workflowScript \}/i);
 		assert.match(description, /runs\.run for one child and runs\.all for parallel work/i);
 		assert.match(description, /repository mutation lanes.*worktree:true.*runs\.run\/runs\.all.*managed isolation/i);
 		assert.doesNotMatch(description, /tasks\[\]|chain\[\]/i);

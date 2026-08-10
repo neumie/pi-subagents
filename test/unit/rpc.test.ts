@@ -337,63 +337,52 @@ describe("subagent extension RPC bridge", () => {
 		bridge.dispose();
 	});
 
-	it("accepts top-level chain and task spawn inputs", async () => {
+	it("rejects removed top-level chain and parallel spawn inputs", async () => {
 		const events = new FakeEvents();
-		const executed: any[] = [];
+		let executeCalls = 0;
 		const bridge = registerSubagentRpcBridge({
 			events,
 			getContext: () => ctx(),
-			execute: async (_id, params) => {
-				executed.push(params);
-				return { content: [{ type: "text", text: "started" }], details: { mode: "parallel", results: [] } } as any;
-			},
+			execute: async () => { executeCalls++; throw new Error("unreachable"); },
 		});
 
 		const chainReply = await request(events, "spawn-chain", "spawn", { chain: [{ agent: "worker" }] });
 		const parallelReply = await request(events, "spawn-parallel", "spawn", { tasks: [{ agent: "worker", task: "work" }] });
 		const worktreeReply = await request(events, "spawn-worktree", "spawn", { worktree: true });
 
-		assert.equal(chainReply.success, true);
-		assert.equal(parallelReply.success, true);
+		assert.equal(chainReply.success, false);
+		assert.equal(parallelReply.success, false);
 		assert.equal(worktreeReply.success, false);
-		assert.equal(executed.length, 2);
-		assert.equal(executed.every((params) => params.async === true), true);
+		assert.match((chainReply as { error?: { message?: string } }).error?.message ?? "", /workflowScript/);
+		assert.equal(executeCalls, 0);
 		bridge.dispose();
 	});
 
-	it("accepts direct detached spawn but rejects foreground and management requests", async () => {
+	it("rejects foreground or management spawn requests before executor dispatch", async () => {
 		const events = new FakeEvents();
 		let executeCalls = 0;
-		let executedParams: any;
 		const bridge = registerSubagentRpcBridge({
 			events,
 			getContext: () => ctx(),
-			execute: async (_id, params) => {
+			execute: async () => {
 				executeCalls++;
-				executedParams = params;
-				return { content: [{ type: "text", text: "started" }], details: { mode: "single", results: [] } } as any;
+				return { content: [{ type: "text", text: "unexpected" }], details: { mode: "single", results: [] } } as any;
 			},
 		});
 
-		const direct = await request(events, "spawn-direct", "spawn", { agent: "worker", task: "Do work", clarify: false });
+		const direct = await request(events, "spawn-direct", "spawn", { agent: "worker", task: "Do work" });
 		const foreground = await request(events, "spawn-foreground", "spawn", { workflowScript: "return runs.run('main', { agent: 'worker' })", async: false });
-		const clarifyUi = await request(events, "spawn-clarify", "spawn", { agent: "worker", clarify: true });
 		const management = await request(events, "spawn-management", "spawn", { action: "list" });
 
-		assert.equal(direct.success, true);
-		assert.equal(executedParams.agent, "worker");
-		assert.equal(executedParams.task, "Do work");
-		assert.equal(executedParams.clarify, false);
-		assert.equal(executedParams.async, true);
+		assert.equal(direct.success, false);
+		assert.match((direct as { error: { message: string } }).error.message, /Direct execution was removed/);
 
 		assert.equal(foreground.success, false);
 		assert.equal((foreground as { error: { code: string; message: string } }).error.code, "invalid_params");
 		assert.match((foreground as { error: { message: string } }).error.message, /detached async/);
-		assert.equal(clarifyUi.success, false);
-		assert.match((clarifyUi as { error: { message: string } }).error.message, /does not support the clarify UI/);
 		assert.equal(management.success, false);
 		assert.match((management as { error: { message: string } }).error.message, /does not accept management/);
-		assert.equal(executeCalls, 1);
+		assert.equal(executeCalls, 0);
 
 		bridge.dispose();
 	});

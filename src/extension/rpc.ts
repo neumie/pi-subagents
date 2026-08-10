@@ -429,9 +429,6 @@ function spawnParams(params: unknown): SubagentParamsLike {
 	if (input.async === false) {
 		throw new SubagentRpcError("invalid_params", "RPC spawn only supports detached async launches; omit async or set async: true.");
 	}
-	if (input.clarify === true) {
-		throw new SubagentRpcError("invalid_params", "RPC spawn does not support the clarify UI; omit clarify or set clarify: false.");
-	}
 	return { ...(normalized.params as SubagentParamsLike), async: true };
 }
 

@@ -377,7 +377,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		);
 
 		assert.equal(result.isError, true);
-		assert.match(result.content[0]?.text ?? "", /action=single is not a management action/);
+		assert.match(result.content[0]?.text ?? "", /Direct execution was removed/);
 		assert.equal(mockPi.callCount(), 0);
 	});
 
