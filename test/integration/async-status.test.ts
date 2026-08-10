@@ -244,6 +244,28 @@ describe("async status helpers", () => {
 		}
 	});
 
+	it("does not infer workflow activity from the workflow launch time", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-async-workflow-no-false-activity-"));
+		try {
+			const now = Date.now();
+			createAsyncDir(root, "workflow-running", {
+				runId: "workflow-running",
+				mode: "workflow",
+				state: "running",
+				startedAt: now - 120_000,
+				lastUpdate: now - 120_000,
+				steps: [{ agent: "main", workflowKey: "main", status: "running", startedAt: now - 120_000 }],
+			});
+
+			const runs = listAsyncRuns(root, { states: ["running"] });
+			assert.equal(runs[0]?.lastActivityAt, undefined);
+			assert.equal(runs[0]?.steps[0]?.lastActivityAt, undefined);
+			assert.doesNotMatch(formatAsyncRunList(runs), /active 2m ago/);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
 	it("does not smear run-level attention state across running siblings when step metadata exists", () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-async-step-attention-"));
 		try {

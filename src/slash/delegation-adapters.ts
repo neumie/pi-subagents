@@ -286,19 +286,6 @@ export function toDelegationUpdate(requestId: string, update: PromptTemplateBrid
 	};
 }
 
-export function toLegacyExecutionParams(request: PromptTemplateDelegationRequest): DelegatedSubagentExecutionParams {
-	return {
-		agent: request.agent,
-		task: request.task,
-		context: request.context,
-		model: request.model,
-		cwd: request.cwd,
-		async: false,
-		foregroundOnly: true,
-		clarify: false,
-	};
-}
-
 export function toSubagentDelegationExecutionParams(request: SubagentDelegationRequest): DelegatedSubagentExecutionParams {
 	return {
 		agent: request.agent,

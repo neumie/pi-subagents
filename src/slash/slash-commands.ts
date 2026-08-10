@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { keyText, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { Key, matchesKey, type Component, type TUI } from "@earendil-works/pi-tui";
+import { Key, matchesKey, truncateToWidth, type Component, type TUI } from "@earendil-works/pi-tui";
 import { BUILTIN_AGENT_NAMES, discoverAgents } from "../agents/agents.ts";
 import {
 	DEFAULT_PROVIDER_MODELS_MAX_AGE_DAYS,
@@ -17,11 +17,12 @@ import type { SubagentParamsLike } from "../runs/foreground/subagent-executor.ts
 import { findModelInfo, toModelInfo } from "../shared/model-info.ts";
 import { formatTokens, shortenPath } from "../shared/formatters.ts";
 import { listAsyncRuns, formatAsyncRunProgressLabel, type AsyncRunSummary } from "../runs/background/async-status.ts";
-import { scheduledRunStorePath } from "../runs/background/scheduled-runs.ts";
+import { listScheduledRunSummaries } from "../runs/background/scheduled-runs.ts";
 import { SUBAGENT_FANOUT_CHILD_ENV } from "../runs/shared/pi-args.ts";
 import type { SlashSubagentResponse, SlashSubagentUpdate } from "./slash-bridge.ts";
 import { registerPromptWorkflowCommands } from "./prompt-workflows.ts";
 import { openSubagentsAdmin } from "./subagents-admin.ts";
+import { SUBAGENT_GUIDE_TOPICS } from "../extension/subagent-guide.ts";
 import { openSubagentFleet } from "../tui/fleet.ts";
 import {
 	applySlashUpdate,
@@ -161,7 +162,7 @@ type StopSelectorResult = { confirmed: boolean; target?: StopSelectorTarget };
 
 function commandForTarget(target: StopSelectorTarget): string {
 	return target.kind === "scheduled"
-		? `subagent({ action: "schedule-cancel", id: ${JSON.stringify(target.id)} })`
+		? `subagent({ action: "schedule.pause", id: ${JSON.stringify(target.id)} })`
 		: `subagent({ action: "stop", id: ${JSON.stringify(target.id)} })`;
 }
 
@@ -177,30 +178,21 @@ function formatAsyncStopTarget(run: AsyncRunSummary): StopSelectorTarget {
 	};
 }
 
-function scheduledStopTargets(ctx: ExtensionContext, state: SubagentState): StopSelectorTarget[] {
-	const sessionId = state.currentSessionId ?? ctx.sessionManager.getSessionId();
-	if (!sessionId) return [];
-	const storePath = scheduledRunStorePath(ctx.cwd, sessionId);
-	if (!fs.existsSync(storePath)) return [];
-	let parsed: unknown;
+function scheduledStopTargets(ctx: ExtensionContext, _state: SubagentState): StopSelectorTarget[] {
 	try {
-		parsed = JSON.parse(fs.readFileSync(storePath, "utf-8"));
+		return listScheduledRunSummaries(ctx.cwd)
+			.filter((schedule) => !schedule.paused && !schedule.activeRunId && schedule.trigger.nextRunAt)
+			.sort((left, right) => left.trigger.nextRunAt!.localeCompare(right.trigger.nextRunAt!))
+			.map((schedule) => ({
+				kind: "scheduled" as const,
+				id: schedule.id,
+				label: `${schedule.id} · ${schedule.name}`,
+				detail: `scheduled · ${schedule.trigger.nextRunAt}`,
+				actionLabel: "pause schedule",
+			}));
 	} catch {
 		return [];
 	}
-	const jobs = parsed && typeof parsed === "object" && Array.isArray((parsed as { jobs?: unknown }).jobs)
-		? (parsed as { jobs: Array<Record<string, unknown>> }).jobs
-		: [];
-	return jobs
-		.filter((job) => job.state === "scheduled" && typeof job.id === "string" && typeof job.name === "string" && typeof job.runAt === "number")
-		.sort((left, right) => Number(left.runAt) - Number(right.runAt))
-		.map((job) => ({
-			kind: "scheduled" as const,
-			id: String(job.id),
-			label: `${String(job.id)} · ${String(job.name)}`,
-			detail: `scheduled · ${new Date(Number(job.runAt)).toISOString()}`,
-			actionLabel: "cancel scheduled run",
-		}));
 }
 
 function discoverStopTargets(ctx: ExtensionContext, state: SubagentState): StopSelectorTarget[] {
@@ -290,7 +282,7 @@ class SubagentsStopSelector implements Component {
 	invalidate(): void {}
 
 	render(width: number): string[] {
-		const contentWidth = Math.max(40, Math.min(this.width, width || this.width));
+		const contentWidth = Math.max(0, Math.min(this.width, Math.floor(width)));
 		const lines = [this.theme.bold("Stop subagent run"), this.theme.fg("dim", "Select a current-session async run to stop, or a scheduled run to cancel."), ""];
 		const maxRows = 10;
 		const start = Math.max(0, Math.min(this.selected - maxRows + 1, Math.max(0, this.targets.length - maxRows)));
@@ -314,7 +306,7 @@ class SubagentsStopSelector implements Component {
 		} else {
 			lines.push(this.theme.fg("dim", "↑↓/jk select · Enter confirm · Esc cancel"));
 		}
-		return lines;
+		return lines.map((line) => truncateToWidth(line, contentWidth));
 	}
 }
 
@@ -630,6 +622,9 @@ function launchSlashSubagent(
 	void runSlashSubagent(pi, ctx, params);
 }
 
+function slashRunWorkflowScript(key: string, child: Record<string, unknown>): string {
+	return `return runs.run(${JSON.stringify(key)}, ${JSON.stringify(child)})`;
+}
 
 export function registerSlashCommands(
 	pi: ExtensionAPI,
@@ -662,7 +657,7 @@ export function registerSlashCommands(
 	});
 
 	pi.registerCommand("run", {
-		description: "Run a subagent directly: /run agent[output=file] [task] [--bg] [--fork]",
+		description: "Run one subagent through workflowScript: /run agent[output=file] [task] [--bg] [--fork]",
 		getArgumentCompletions: makeAgentCompletions(state),
 		handler: async (args, ctx) => {
 			const { args: cleanedArgs, bg, fork } = extractExecutionFlags(args);
@@ -680,14 +675,13 @@ export function registerSlashCommands(
 			if (inline.reads && Array.isArray(inline.reads) && inline.reads.length > 0) {
 				finalTask = `[Read from: ${inline.reads.join(", ")}]\n\n${finalTask}`;
 			}
-			const params: SubagentParamsLike = { agent: agentName, task: finalTask, clarify: false, agentScope: "both" };
-			if (inline.output !== undefined) params.output = inline.output;
-			if (inline.outputMode !== undefined) params.outputMode = inline.outputMode;
-			if (inline.skill !== undefined) params.skill = inline.skill;
-			if (inline.model) params.model = inline.model;
-			if (bg) params.async = true;
-			if (fork) params.context = "fork";
-			launchSlashSubagent(pi, ctx, params);
+			const child: Record<string, unknown> = { agent: agentName, task: finalTask, agentScope: "both" };
+			if (inline.output !== undefined) child.output = inline.output;
+			if (inline.outputMode !== undefined) child.outputMode = inline.outputMode;
+			if (inline.skill !== undefined) child.skill = inline.skill;
+			if (inline.model) child.model = inline.model;
+			if (fork) child.context = "fork";
+			launchSlashSubagent(pi, ctx, { workflowScript: slashRunWorkflowScript("run", child), async: bg ? true : false });
 		},
 	});
 
@@ -702,6 +696,34 @@ export function registerSlashCommands(
 		description: "Show subagent diagnostics",
 		handler: async (_args, ctx) => {
 			await runSlashSubagent(pi, ctx, { action: "doctor" });
+		},
+	});
+
+	pi.registerCommand("subagents-guide", {
+		description: "Show a packaged subagents guide topic",
+		getArgumentCompletions: (prefix) => prefix.includes(" ") ? null : SUBAGENT_GUIDE_TOPICS
+			.filter((topic) => topic.startsWith(prefix))
+			.map((topic) => ({ value: topic, label: topic })),
+		handler: async (args, ctx) => {
+			const topic = args.trim();
+			if (topic.includes(" ")) {
+				ctx.ui.notify("Usage: /subagents-guide [topic]", "error");
+				return;
+			}
+			await runSlashSubagent(pi, ctx, { action: "guide", ...(topic ? { topic } : {}) });
+		},
+	});
+
+	pi.registerCommand("subagents-refine", {
+		description: "Generate a bounded project-local refinement overlay for one subagent",
+		getArgumentCompletions: makeAgentCompletions(state),
+		handler: async (args, ctx) => {
+			const parts = args.trim().split(/\s+/).filter(Boolean);
+			if (parts.length !== 1) {
+				ctx.ui.notify("Usage: /subagents-refine <agent>", "error");
+				return;
+			}
+			await runSlashSubagent(pi, ctx, { action: "refine", agent: parts[0] });
 		},
 	});
 
@@ -779,7 +801,7 @@ export function registerSlashCommands(
 			);
 			if (!result?.confirmed || !result.target) return;
 			if (result.target.kind === "scheduled") {
-				await runSlashSubagent(pi, ctx, { action: "schedule-cancel", id: result.target.id });
+				await runSlashSubagent(pi, ctx, { action: "schedule.pause", id: result.target.id });
 				return;
 			}
 			await runSlashSubagent(pi, ctx, { action: "stop", id: result.target.id });

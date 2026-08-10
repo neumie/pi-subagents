@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
+import { visibleWidth } from "@earendil-works/pi-tui";
 
 const { buildWidgetLines, clearLegacyResultAnimationTimer, renderWidget } = await import("../../src/tui/render.ts") as {
-	buildWidgetLines: (jobs: Array<Record<string, unknown>>, theme: { fg(name: string, text: string): string; bold(text: string): string }, width?: number, expanded?: boolean) => string[];
+	buildWidgetLines: (jobs: Array<Record<string, unknown>>, theme: { fg(name: string, text: string): string; bold(text: string): string }, width?: number, expanded?: boolean, frame?: number) => string[];
 	clearLegacyResultAnimationTimer: (context: { state: { subagentResultAnimationTimer?: ReturnType<typeof setInterval> } }) => void;
 	renderWidget: (ctx: Record<string, unknown>, jobs: Array<Record<string, unknown>>) => void;
 };
@@ -55,7 +56,7 @@ function createUiContext() {
 }
 
 function renderWidgetLines(widget: unknown, width = 180): string[] {
-	return (widget as (_tui: unknown, widgetTheme: typeof theme) => { render(width: number): string[] })(undefined, theme).render(width);
+	return (widget as (_tui: { requestRender(): void }, widgetTheme: typeof theme) => { render(width: number): string[] })({ requestRender() {} }, theme).render(width);
 }
 
 function restoreDescriptor(target: object, key: string, descriptor: PropertyDescriptor | undefined): void {
@@ -153,6 +154,38 @@ describe("subagent async widget rendering", () => {
 		assert.match(text, /Press configured-expand-key for live detail/);
 		assert.doesNotMatch(text, /widget truncated/);
 		assert.ok(lines.length <= 10, "collapsed component should stay under Pi's string-widget cap even though it bypasses it");
+	});
+
+	it("honors the component render width instead of the terminal width", () => {
+		resetWidgetLayout();
+		withStdoutSize(50, 120, () => {
+			const ui = createUiContext();
+			renderWidget(ui.ctx as never, [{
+				asyncId: "run-narrow",
+				asyncDir: "/tmp/pi-subagents-uid-1000/async-subagent-runs/call_with_a_long_identifier",
+				status: "running",
+				mode: "parallel",
+				agents: ["correctness", "tests-maintainability"],
+				activeParallelGroup: true,
+				runningSteps: 2,
+				completedSteps: 0,
+				stepsTotal: 2,
+				steps: [
+					{ index: 0, agent: "correctness", status: "running" },
+					{ index: 1, agent: "tests-maintainability", status: "running" },
+				],
+			}]);
+
+			const widget = ui.widgets.at(-1);
+			for (const width of [0, 1, 2, 3, 74]) {
+				const lines = renderWidgetLines(widget, width);
+				assert.ok(lines.length > 0);
+				for (const line of lines) {
+					assert.ok(visibleWidth(line) <= width, `widget line exceeds render width: ${visibleWidth(line)} > ${width}`);
+				}
+			}
+		});
+		resetWidgetLayout();
 	});
 
 	it("locks crowded collapsed widget height for the current terminal session", () => {
@@ -449,6 +482,119 @@ describe("subagent async widget rendering", () => {
 		assert.match(expandedText, /checking expanded state/);
 	});
 
+	it("compacts noisy repeated live output in expanded async widget rows", () => {
+		const now = Date.now();
+		const job = {
+			asyncId: "run-noisy",
+			asyncDir: "/tmp/noisy",
+			status: "running",
+			mode: "parallel",
+			agents: ["reviewer"],
+			activeParallelGroup: true,
+			runningSteps: 1,
+			completedSteps: 0,
+			stepsTotal: 1,
+			updatedAt: now,
+			steps: [
+				{
+					index: 0,
+					agent: "reviewer",
+					status: "running",
+					currentTool: "read",
+					currentToolArgs: "src/tui/render.ts",
+					currentToolStartedAt: now - 2000,
+					recentOutput: [
+						"I will read the required plan first.",
+						"I will inspect the exact head.",
+						"I will read the relevant implementation seams.",
+						"I will verify the action list.",
+						"I will inspect the public tool schema.",
+						"I will check the async launch path.",
+						"I will read agent default application path.",
+					],
+				},
+			],
+		};
+
+		const expandedText = buildWidgetLines([job], theme, 180, true).join("\n");
+		assert.match(expandedText, /↻ 7 progress updates/);
+		assert.match(expandedText, /latest: read agent default application path/);
+		assert.match(expandedText, /pattern: repeated short status lines/);
+		assert.doesNotMatch(expandedText, /required plan first/);
+	});
+
+	it("keeps mixed live output raw instead of hiding non-status lines", () => {
+		const now = Date.now();
+		const job = {
+			asyncId: "run-mixed",
+			asyncDir: "/tmp/mixed",
+			status: "running",
+			mode: "parallel",
+			agents: ["reviewer"],
+			activeParallelGroup: true,
+			runningSteps: 1,
+			completedSteps: 0,
+			stepsTotal: 1,
+			updatedAt: now,
+			steps: [
+				{
+					index: 0,
+					agent: "reviewer",
+					status: "running",
+					recentOutput: [
+						"I will read the required plan first.",
+						"I will inspect the exact head.",
+						"I will verify the action list.",
+						"I will check the async launch path.",
+						"error: failed to fetch review threads",
+						"details: GraphQL returned 502",
+					],
+				},
+			],
+		};
+
+		const expandedText = buildWidgetLines([job], theme, 180, true).join("\n");
+		assert.doesNotMatch(expandedText, /↻/);
+		assert.match(expandedText, /error: failed to fetch review threads/);
+		assert.match(expandedText, /details: GraphQL returned 502/);
+	});
+
+	it("keeps status-looking error signals visible", () => {
+		const now = Date.now();
+		const job = {
+			asyncId: "run-status-error",
+			asyncDir: "/tmp/status-error",
+			status: "running",
+			mode: "parallel",
+			agents: ["reviewer"],
+			activeParallelGroup: true,
+			runningSteps: 1,
+			completedSteps: 0,
+			stepsTotal: 1,
+			updatedAt: now,
+			steps: [
+				{
+					index: 0,
+					agent: "reviewer",
+					status: "running",
+					recentOutput: [
+						"Checking permissions: Access Denied",
+						"Checking token state: error from GitHub",
+						"Checking CI: failed",
+						"Checking retry: timed out",
+						"Checking fallback: unable to recover",
+						"Checking final status: rejected",
+					],
+				},
+			],
+		};
+
+		const expandedText = buildWidgetLines([job], theme, 180, true).join("\n");
+		assert.doesNotMatch(expandedText, /↻/);
+		assert.match(expandedText, /older signal line: Checking permissions: Access Denied/);
+		assert.match(expandedText, /Checking final status: rejected/);
+	});
+
 	it("shows step detail and configured live detail key hint for running single async jobs with steps", () => {
 		const now = Date.now();
 		const job = {
@@ -675,6 +821,42 @@ describe("subagent async widget rendering", () => {
 
 		assert.deepEqual(second, first);
 		assert.equal(firstGrapheme(first[1] ?? ""), firstGrapheme(second[1] ?? ""));
+	});
+
+	it("keeps component widget output stable without job data changes", () => {
+		const originalNow = Date.now;
+		let renderRequests = 0;
+		try {
+			Date.now = () => 1_000;
+			const ui = createUiContext();
+			renderWidget(ui.ctx as never, [{
+				asyncId: "run-stable",
+				asyncDir: "/tmp/run",
+				status: "running",
+				mode: "parallel",
+				agents: ["reviewer"],
+				activeParallelGroup: true,
+				runningSteps: 1,
+				completedSteps: 0,
+				stepsTotal: 1,
+				updatedAt: 1_000,
+				steps: [{ index: 0, agent: "reviewer", status: "running" }],
+			}]);
+			const component = (ui.widgets.at(-1) as (_tui: { requestRender(): void }, widgetTheme: typeof theme) => { render(width: number): string[] })(
+				{ requestRender: () => { renderRequests += 1; } },
+				theme,
+			);
+			const first = component.render(180).join("\n");
+
+			Date.now = () => 1_600;
+			const second = component.render(180).join("\n");
+
+			assert.equal(renderRequests, 0, "quiet progress must not schedule editor-wide redraws");
+			assert.equal(second, first, "elapsed wall time alone must not change the widget");
+		} finally {
+			Date.now = originalNow;
+			renderWidget(createUiContext().ctx as never, []);
+		}
 	});
 
 	it("does not animate queued-only widgets", async () => {

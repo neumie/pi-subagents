@@ -7,6 +7,7 @@ import { existsSync, unlinkSync } from "node:fs";
 import * as path from "node:path";
 import type { Message } from "@earendil-works/pi-ai";
 import type { AgentConfig } from "../../agents/agents.ts";
+import { appendAgentRefinementOverlay } from "../../agents/agent-refinements.ts";
 import {
 	ensureArtifactsDir,
 	formatOutputArtifactContent,
@@ -87,7 +88,7 @@ import {
 	shouldEscalateMutatingFailures,
 	summarizeRecentMutatingFailures,
 } from "../shared/long-running-guard.ts";
-import { acceptanceFailureMessage, buildSkippedAcceptanceLedger, evaluateAcceptance, formatAcceptancePrompt, resolveEffectiveAcceptance, stripAcceptanceReport } from "../shared/acceptance.ts";
+import { acceptanceFailureMessage, buildSkippedAcceptanceLedger, evaluateAcceptance, formatAcceptancePrompt, resolveEffectiveAcceptance, stripAcceptanceReport, validateAcceptanceInput } from "../shared/acceptance.ts";
 import { attachContractProjections, isAgentContractV1 } from "../shared/agent-contract.ts";
 import { appendTurnBudgetSystemPrompt, formatTurnBudgetOutput, initialTurnBudgetState, turnBudgetDecision, turnBudgetDeferredNote, turnBudgetDeferredState, turnBudgetExceededMessage, turnBudgetSoftNote, turnBudgetState } from "../shared/turn-budget.ts";
 import { initialToolBudgetState, toolBudgetState } from "../shared/tool-budget.ts";
@@ -458,6 +459,7 @@ async function runSingleAttempt(
 	const spawnEnv = { ...process.env, ...sharedEnv, ...getSubagentDepthEnv(options.maxSubagentDepth) };
 	let observedMutationAttempt = false;
 	let structuredOutputToolInvoked = false;
+	let structuredOutputMessageStartIndex: number | undefined;
 
 	const exitCode = await new Promise<number>((resolve) => {
 		const spawnSpec = getPiSpawnCommand(args);
@@ -873,7 +875,10 @@ async function runSingleAttempt(
 				const toolArgs = evt.args && typeof evt.args === "object" && !Array.isArray(evt.args)
 					? evt.args as Record<string, unknown>
 					: {};
-				if (options.structuredOutput && evt.toolName === "structured_output") structuredOutputToolInvoked = true;
+				if (options.structuredOutput && evt.toolName === "structured_output") {
+					structuredOutputToolInvoked = true;
+					structuredOutputMessageStartIndex = result.messages?.length ?? 0;
+				}
 				if (options.allowIntercomDetach && (evt.toolName === "intercom" || evt.toolName === "contact_supervisor")) {
 					intercomStarted = true;
 				}
@@ -984,14 +989,14 @@ async function runSingleAttempt(
 			}
 		};
 
-		if (controlConfig.enabled) {
+		fireUpdate();
+		if (controlConfig.enabled || options.onUpdate) {
 			activityTimer = setInterval(() => {
-				if (processClosed || lifecycleFinished) return;
-				const now = Date.now();
-				if (updateActivityState(now)) {
-					progress.durationMs = now - startTime;
-					fireUpdate();
+				if (processClosed || lifecycleFinished) {
+					return;
 				}
+				updateActivityState(Date.now());
+				fireUpdate();
 			}, 1000);
 			activityTimer.unref?.();
 		}
@@ -1182,24 +1187,7 @@ async function runSingleAttempt(
 	if (result.error && result.exitCode === 0) {
 		result.exitCode = 1;
 	}
-	if (result.exitCode === 0 && !result.error) {
-		const messages = result.messages ?? [];
-		const finalText = getFinalOutput(messages);
-		const missingStructuredOutput = options.structuredOutput
-			? !existsSync(options.structuredOutput.outputPath)
-			: false;
-		const errInfo = detectSubagentError(messages);
-		const missingOutput = !finalText?.trim() && (!options.structuredOutput || missingStructuredOutput);
-		if (missingOutput && (!errInfo.hasError || hasEmptyTerminalAssistantResponse(messages))) {
-			result.exitCode = 1;
-			result.error = "Subagent produced no output (possible model cold-start or empty response).";
-		} else if (errInfo.hasError) {
-			result.exitCode = errInfo.exitCode ?? 1;
-			result.error = errInfo.details
-				? `${errInfo.errorType} failed (exit ${errInfo.exitCode}): ${errInfo.details}`
-				: `${errInfo.errorType} failed with exit code ${errInfo.exitCode}`;
-		}
-	}
+	let validatedStructuredOutput = false;
 	if (options.structuredOutput && result.exitCode === 0 && !result.error) {
 		result.structuredOutputSchemaPath = options.structuredOutput.schemaPath;
 		result.structuredOutputPath = options.structuredOutput.outputPath;
@@ -1219,7 +1207,26 @@ async function runSingleAttempt(
 				result.structuredOutputFailed = true;
 			} else {
 				result.structuredOutput = structured.value;
+				validatedStructuredOutput = true;
 			}
+		}
+	}
+	if (result.exitCode === 0 && !result.error) {
+		const messages = result.messages ?? [];
+		const finalText = getFinalOutput(messages);
+		const errorMessages = validatedStructuredOutput
+			? messages.slice(structuredOutputMessageStartIndex ?? messages.length)
+			: messages;
+		const errInfo = detectSubagentError(errorMessages);
+		const missingOutput = !finalText?.trim() && !validatedStructuredOutput;
+		if (missingOutput && (!errInfo.hasError || hasEmptyTerminalAssistantResponse(messages))) {
+			result.exitCode = 1;
+			result.error = "Subagent produced no output (possible model cold-start or empty response).";
+		} else if (errInfo.hasError) {
+			result.exitCode = errInfo.exitCode ?? 1;
+			result.error = errInfo.details
+				? `${errInfo.errorType} failed (exit ${errInfo.exitCode}): ${errInfo.details}`
+				: `${errInfo.errorType} failed with exit code ${errInfo.exitCode}`;
 		}
 	}
 
@@ -1368,6 +1375,18 @@ async function runSyncCompletion(
 			...(options.capabilityCeiling ? { capabilityCeiling: options.capabilityCeiling } : {}),
 		}, options.context);
 	}
+	const acceptanceErrors = validateAcceptanceInput(options.acceptance);
+	if (acceptanceErrors.length > 0) {
+		return withRunContext({
+			index: options.index ?? 0,
+			agent: agentName,
+			task,
+			exitCode: 1,
+			messages: [],
+			usage: emptyUsage(),
+			error: acceptanceErrors.join(" "),
+		}, options.context);
+	}
 	const outputModeValidationError = validateFileOnlyOutputMode(options.outputMode, options.outputPath, `Single run (${agentName})`);
 	if (outputModeValidationError) {
 		return withRunContext({
@@ -1426,6 +1445,7 @@ async function runSyncCompletion(
 	if (memoryInjection) {
 		systemPrompt = systemPrompt ? `${systemPrompt}\n\n${memoryInjection}` : memoryInjection;
 	}
+	systemPrompt = appendAgentRefinementOverlay(systemPrompt, { cwd: skillCwd, agentName });
 	systemPrompt = injectOutputPathSystemPrompt(systemPrompt, options.outputPath, agent);
 
 	const candidates = buildModelCandidates(
@@ -1687,6 +1707,8 @@ async function runSyncCompletion(
 					: undefined,
 				cwd: options.cwd ?? runtimeCwd,
 				reportOptional: isAgentContractV1(options.agentContract),
+				artifactsDir: options.artifactsDir,
+				runId: options.runId,
 			});
 		}
 	} catch (error) {

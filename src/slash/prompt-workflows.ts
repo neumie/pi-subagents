@@ -213,13 +213,19 @@ function workflowParams(workflow: PromptWorkflow, args: string[], runtime: Retur
 	return {
 		agent: runtime.agentOverride ?? workflow.agent,
 		task,
-		clarify: false,
 		agentScope: "both",
 		...(context ? { context } : {}),
 		...(workflow.model ? { model: workflow.model } : {}),
 		...(workflow.skill !== undefined ? { skill: workflow.skill } : {}),
 		...(workflow.cwd ? { cwd: workflow.cwd } : {}),
-		...(runtime.bg ? { async: true } : {}),
+	};
+}
+
+function promptWorkflowExecutionParams(workflows: PromptWorkflow[], args: string[], runtime: ReturnType<typeof parseRuntimeOptions>): SubagentParamsLike {
+	return {
+		workflowScript: promptWorkflowScript(workflows, args, runtime),
+		agentScope: "both",
+		async: runtime.bg ? true : false,
 	};
 }
 
@@ -281,10 +287,10 @@ export function registerPromptWorkflowCommands(input: {
 						if (!step) throw new Error(`Unknown prompt workflow in chain '${workflow.name}': ${stepName}`);
 						return step;
 					});
-					await run({ workflowScript: promptWorkflowScript(chain, runtime.args, runtime), clarify: false, agentScope: "both", ...(runtime.bg ? { async: true } : {}) }, ctx);
+					await run(promptWorkflowExecutionParams(chain, runtime.args, runtime), ctx);
 					return;
 				}
-				await run(workflowParams(workflow, runtime.args, runtime), ctx);
+				await run(promptWorkflowExecutionParams([workflow], runtime.args, runtime), ctx);
 			} catch (error) {
 				ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
 			}

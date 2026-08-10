@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { beforeEach, describe, it } from "node:test";
+import { visibleWidth } from "@earendil-works/pi-tui";
 
 import { scheduledRunStorePath } from "../../src/runs/background/scheduled-runs.ts";
 import { SUBAGENT_FANOUT_CHILD_ENV } from "../../src/runs/shared/pi-args.ts";
@@ -478,6 +479,64 @@ describe("slash command custom message delivery", { skip: !available ? "slash-co
 		clearSlashSnapshots?.();
 	});
 
+	it("/subagents-stop keeps the selector within its allocated width", async () => {
+		await withTempProject("pi-stop-selector-width-", async (root) => {
+			const id = "scheduled-width-check";
+			const nextRunAt = "2099-01-01T00:00:00.000Z";
+			const scheduleDir = path.join(scheduledRunStorePath(root), id);
+			fs.mkdirSync(scheduleDir, { recursive: true });
+			fs.writeFileSync(path.join(scheduleDir, "schedule.json"), JSON.stringify({
+				schemaVersion: 1,
+				id,
+				name: "A very long scheduled run name with wide characters 中文🙂",
+				cwd: root,
+				trigger: { kind: "once", at: nextRunAt, nextRunAt },
+				target: { agent: "scout", task: "Inspect" },
+				overlap: "skip",
+				catchUp: "latest",
+				paused: false,
+				createdAt: "2026-08-06T00:00:00.000Z",
+				updatedAt: "2026-08-06T00:00:00.000Z",
+			}), "utf-8");
+
+			const commands = new Map<string, RegisteredSlashCommand>();
+			const pi = {
+				events: createEventBus(),
+				registerCommand(name: string, spec: RegisteredSlashCommand) { commands.set(name, spec); },
+				registerShortcut() {},
+				sendMessage() {},
+			};
+			const rendered = new Map<number, string[]>();
+			registerSlashCommands!(pi as never, createState(root));
+			await commands.get("subagents-stop")!.handler("", createCommandContext({
+				cwd: root,
+				hasUI: true,
+				custom: async (factory) => {
+					const component = (factory as (
+						tui: { requestRender(): void },
+						theme: { fg(name: string, text: string): string; bold(text: string): string },
+						keybindings: unknown,
+						done: (result: unknown) => void,
+					) => { render(width: number): string[] })(
+						{ requestRender() {} },
+						{ fg: (_name, text) => text, bold: (text) => text },
+						{},
+						() => {},
+					);
+					for (const width of [0, 1, 2, 3, 32]) rendered.set(width, component.render(width));
+					return undefined;
+				},
+			}));
+
+			for (const [width, lines] of rendered) {
+				assert.ok(lines.length > 0);
+				for (const line of lines) {
+					assert.ok(visibleWidth(line) <= width, `stop selector line exceeds render width: ${visibleWidth(line)} > ${width}`);
+				}
+			}
+		});
+	});
+
 	it("/run accepts an agent without a task", async () => {
 		const sent: unknown[] = [];
 		const commands = new Map<string, { handler(args: string, ctx: unknown): Promise<void> }>();
@@ -523,7 +582,7 @@ describe("slash command custom message delivery", { skip: !available ? "slash-co
 		await commands.get("run")!.handler("scout", ctx);
 		await new Promise<void>((resolve) => setImmediate(resolve));
 
-		assert.deepEqual(requestedParams, { agent: "scout", task: "", clarify: false, agentScope: "both" });
+		assert.deepEqual(requestedParams, { workflowScript: "return runs.run(\"run\", {\"agent\":\"scout\",\"task\":\"\",\"agentScope\":\"both\"})", async: false });
 		assert.equal(requestedCtx, ctx);
 		assert.equal(sent.length, 2);
 		assert.equal((sent[0] as { display?: boolean }).display, true);
@@ -690,7 +749,7 @@ Inspect
 `, "utf-8");
 
 			const run = await captureSlashCommandParams("run", "code-analysis.scout Investigate", root);
-			assert.deepEqual(run.params, { agent: "code-analysis.scout", task: "Investigate", clarify: false, agentScope: "both" });
+			assert.deepEqual(run.params, { workflowScript: "return runs.run(\"run\", {\"agent\":\"code-analysis.scout\",\"task\":\"Investigate\",\"agentScope\":\"both\"})", async: false });
 
 			await withIsolatedHome(async () => {
 				const commands = new Map<string, RegisteredSlashCommand>();

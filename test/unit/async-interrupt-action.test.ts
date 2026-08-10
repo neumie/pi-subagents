@@ -31,12 +31,12 @@ function writeJson(filePath: string, value: object): void {
 	fs.writeFileSync(filePath, JSON.stringify(value, null, 2), "utf-8");
 }
 
-function createRunningAsync(state: SubagentState, runId: string, options: { track?: boolean; sessionId?: string; state?: "queued" | "running"; pid?: number } = {}): string {
+function createRunningAsync(state: SubagentState, runId: string, options: { track?: boolean; sessionId?: string; state?: "queued" | "running"; pid?: number; mode?: "single" | "workflow" } = {}): string {
 	const asyncDir = path.join(ASYNC_DIR, runId);
 	const runState = options.state ?? "running";
 	writeJson(path.join(asyncDir, "status.json"), {
 		runId,
-		mode: "single",
+		mode: options.mode ?? "single",
 		state: runState,
 		sessionId: options.sessionId ?? "session",
 		...(options.pid !== undefined ? { pid: options.pid } : runState === "running" ? { pid: 12345 } : {}),
@@ -180,7 +180,7 @@ describe("async interrupt action", () => {
 		}
 	});
 
-	it("interrupts a running async run resolved from disk after in-memory tracking is gone", async () => {
+	it("requests an interrupt without signaling a running async runner", async () => {
 		const state = createState();
 		const runId = `interrupt-disk-${Date.now().toString(36)}`;
 		const asyncDir = createRunningAsync(state, runId, { track: false });
@@ -194,7 +194,27 @@ describe("async interrupt action", () => {
 			assert.equal(result.isError, undefined);
 			assert.match(text(result), new RegExp(`Interrupt requested for async run ${runId}`));
 			assert.equal(fs.existsSync(path.join(asyncDir, "control", "interrupt.json")), true);
-			assert.deepEqual(kills, [{ pid: 12345, signal: 0 }, { pid: 12345, signal: process.platform === "win32" ? "SIGBREAK" : "SIGUSR2" }]);
+			assert.deepEqual(kills, [{ pid: 12345, signal: 0 }]);
+		} finally {
+			cleanup(runId, asyncDir);
+		}
+	});
+
+	it("rejects workflow interrupt instead of signaling a shared host pid", async () => {
+		const state = createState();
+		const runId = `interrupt-workflow-host-${Date.now().toString(36)}`;
+		const asyncDir = createRunningAsync(state, runId, { track: false, mode: "workflow", pid: process.pid });
+		try {
+			const kills: Array<{ pid: number; signal?: NodeJS.Signals | 0 }> = [];
+			const result = await executorWithKill(state, (pid, signal) => {
+				kills.push({ pid, signal });
+				return true;
+			}).execute("interrupt", { action: "interrupt", id: runId }, new AbortController().signal, undefined, ctx());
+
+			assert.equal(result.isError, true);
+			assert.match(text(result), new RegExp(`Interrupt is unsupported for async workflow ${runId}; use stop instead\\.`));
+			assert.equal(fs.existsSync(path.join(asyncDir, "control", "interrupt.json")), false);
+			assert.deepEqual(kills, [{ pid: process.pid, signal: 0 }]);
 		} finally {
 			cleanup(runId, asyncDir);
 		}
@@ -217,26 +237,6 @@ describe("async interrupt action", () => {
 			assert.match(text(result), /Interrupt is unsupported for one-shot external CLI async run/);
 			assert.equal(fs.existsSync(path.join(asyncDir, "control", "interrupt.json")), false);
 			assert.equal(JSON.parse(fs.readFileSync(statusPath, "utf-8")).state, "running");
-		} finally {
-			cleanup(runId, asyncDir);
-		}
-	});
-
-	it("reports success and writes the portable request when the signal is unavailable", async () => {
-		const state = createState();
-		const runId = `interrupt-enosys-${Date.now().toString(36)}`;
-		const asyncDir = createRunningAsync(state, runId);
-		try {
-			const result = await executorWithKill(state, (_pid, signal) => {
-				if (signal === 0) return true;
-				const error = new Error("kill ENOSYS") as NodeJS.ErrnoException;
-				error.code = "ENOSYS";
-				throw error;
-			}).execute("interrupt", { action: "interrupt", id: runId }, new AbortController().signal, undefined, ctx());
-
-			assert.equal(result.isError, undefined);
-			assert.match(text(result), new RegExp(`Interrupt requested for async run ${runId}`));
-			assert.equal(fs.existsSync(path.join(asyncDir, "control", "interrupt.json")), true);
 		} finally {
 			cleanup(runId, asyncDir);
 		}

@@ -100,21 +100,25 @@ function nestedFleetRows(children: NestedRunSummary[] | undefined): FleetNestedR
 		const steps = (child.mode === "parallel" || child.mode === "chain") ? child.steps ?? [] : [];
 		if (steps.length > 0) {
 			for (const step of steps) {
+				const modelThinking = formatModelThinking(step.model, step.thinking) || undefined;
+				const activity = nestedActivity(step);
 				rows.push({
 					name: step.agent,
 					state: step.status,
-					...(formatModelThinking(step.model, step.thinking) ? { modelThinking: formatModelThinking(step.model, step.thinking) } : {}),
-					...(nestedActivity(step) ? { activity: nestedActivity(step) } : {}),
+					...(modelThinking ? { modelThinking } : {}),
+					...(activity ? { activity } : {}),
 					...(step.startedAt !== undefined ? { startedAt: step.startedAt } : {}),
 				});
 			}
 			continue;
 		}
+		const modelThinking = formatModelThinking(child.model, child.thinking) || undefined;
+		const activity = nestedActivity(child);
 		rows.push({
 			name: nestedRunLabel(child),
 			state: child.state,
-			...(formatModelThinking(child.model, child.thinking) ? { modelThinking: formatModelThinking(child.model, child.thinking) } : {}),
-			...(nestedActivity(child) ? { activity: nestedActivity(child) } : {}),
+			...(modelThinking ? { modelThinking } : {}),
+			...(activity ? { activity } : {}),
 			...(child.startedAt !== undefined ? { startedAt: child.startedAt } : {}),
 		});
 	}
@@ -407,12 +411,14 @@ export class SubagentFleetStatus {
 
 	render(width: number, theme: Theme): string[] {
 		if (this.entries.length === 0) return [];
+		if (!this.active) {
+			const tokens = this.entries.reduce((total, entry) => total + entry.tokens, 0);
+			const label = `${this.entries.length} active ${this.entries.length === 1 ? "agent" : "agents"}`;
+			return [truncateToWidth(`  ${theme.fg("muted", label)} · ${theme.fg("dim", `${formatFleetTokens(tokens)} · ↓/← to inspect`)}`, width)];
+		}
 		const roster = this.rosterKeys();
 		const selectedIndex = Math.max(0, roster.indexOf(this.selectedKey));
-		const hint = this.active
-			? "↑↓/jk select · enter inspect · esc back"
-			: "esc to interrupt · ← for agents · ↓ to manage";
-		const lines = [truncateToWidth(`  ${theme.fg("dim", hint)}`, width), ""];
+		const lines = [truncateToWidth(`  ${theme.fg("dim", "↑↓/jk select · enter inspect · esc back")}`, width), ""];
 		lines.push(truncateToWidth(`  ${this.bullet(0, selectedIndex, theme)} main`, width));
 
 		const tree = fleetTreeRows(this.entries);
@@ -454,7 +460,7 @@ export class SubagentFleetStatus {
 	}
 
 	private bullet(rosterIndex: number, selectedIndex: number, theme: Theme): string {
-		return rosterIndex === selectedIndex ? theme.fg("accent", "⏺") : theme.fg("dim", "◯");
+		return rosterIndex === selectedIndex ? theme.fg("accent", ">") : " ";
 	}
 
 	private rosterKeys(): string[] {
@@ -490,23 +496,25 @@ export class SubagentFleetStatus {
 			active: this.active,
 			selected: this.selectedKey,
 			inspectorOpen: this.inspectorOpen,
-			entries: this.entries.map((entry) => [
-				entry.key,
-				entry.agent,
-				entry.state,
-				entry.modelThinking,
-				entry.description,
-				Math.round((now - entry.startedAt) / 1000),
-				entry.tokens,
-				entry.nestedChildren?.map((child) => [
-					child.id,
-					child.state,
-					child.model,
-					child.thinking,
-					child.lastUpdate,
-					child.steps?.map((step) => [step.agent, step.status, step.model, step.thinking, step.lastActivityAt]),
-				]),
-			]),
+			entries: this.entries.map((entry) => this.active
+				? [
+					entry.key,
+					entry.agent,
+					entry.state,
+					entry.modelThinking,
+					entry.description,
+					Math.round((now - entry.startedAt) / 1000),
+					entry.tokens,
+					entry.nestedChildren?.map((child) => [
+						child.id,
+						child.state,
+						child.model,
+						child.thinking,
+						child.lastUpdate,
+						child.steps?.map((step) => [step.agent, step.status, step.model, step.thinking, step.lastActivityAt]),
+					]),
+				]
+				: [entry.key, entry.state, entry.tokens]),
 		});
 	}
 

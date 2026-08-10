@@ -65,6 +65,7 @@ interface AsyncRunStepSummary {
 export interface AsyncRunSummary {
 	id: string;
 	asyncDir: string;
+	toolCallId?: string;
 	sessionId?: string;
 	state: "queued" | "running" | "complete" | "failed" | "paused" | "stopped" | "rejected";
 	error?: string;
@@ -206,7 +207,10 @@ function deriveAsyncActivityState(asyncDir: string, status: AsyncStatus): { acti
 	const currentStep = typeof status.currentStep === "number" ? status.steps?.[status.currentStep] : undefined;
 	return {
 		activityState: status.activityState,
-		lastActivityAt: status.lastActivityAt ?? outputFileMtime(outputPath) ?? currentStep?.lastActivityAt ?? currentStep?.startedAt ?? status.startedAt,
+		lastActivityAt: status.lastActivityAt
+			?? outputFileMtime(outputPath)
+			?? currentStep?.lastActivityAt
+			?? (status.mode === "workflow" ? undefined : currentStep?.startedAt ?? status.startedAt),
 	};
 }
 
@@ -288,6 +292,7 @@ function statusToSummary(asyncDir: string, status: AsyncStatus & { cwd?: string 
 	return {
 		id: status.runId || path.basename(asyncDir),
 		asyncDir,
+		...(status.toolCallId ? { toolCallId: status.toolCallId } : {}),
 		...(status.sessionId ? { sessionId: status.sessionId } : {}),
 		state: status.state,
 		...(status.error ? { error: status.error } : {}),

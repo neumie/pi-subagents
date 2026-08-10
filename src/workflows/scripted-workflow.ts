@@ -37,11 +37,17 @@ const runFingerprints = new Map();
 function validateRunCall(key, params, label, fingerprints) {
   if (typeof key !== "string" || !runKeyPattern.test(key)) throw new Error(label + " has an invalid key.");
   if (!params || typeof params !== "object" || Array.isArray(params)) throw new Error(label + " requires a params object.");
-  if (Object.prototype.hasOwnProperty.call(params, "action") || Object.prototype.hasOwnProperty.call(params, "workflowScript") || Object.prototype.hasOwnProperty.call(params, "tasks") || Object.prototype.hasOwnProperty.call(params, "chain") || Object.prototype.hasOwnProperty.call(params, "concurrency") || Object.prototype.hasOwnProperty.call(params, "chainDir")) {
+  if (Object.prototype.hasOwnProperty.call(params, "action") || Object.prototype.hasOwnProperty.call(params, "workflowScript") || Object.prototype.hasOwnProperty.call(params, "tasks") || Object.prototype.hasOwnProperty.call(params, "chain") || Object.prototype.hasOwnProperty.call(params, "parallel") || Object.prototype.hasOwnProperty.call(params, "concurrency") || Object.prototype.hasOwnProperty.call(params, "chainDir")) {
     const hint = label === "runs.run" ? "; use runs.all(...) and JavaScript control flow for orchestration." : ".";
     throw new Error(label + " accepts one child via { agent, task } and execution controls only" + hint);
   }
   if (params.worktree !== undefined && typeof params.worktree !== "boolean") throw new Error(label + " worktree must be true or false.");
+  if (params.gate !== undefined && (typeof params.gate !== "string" || !params.gate.trim())) throw new Error(label + " gate must be a non-empty command string.");
+  if (params.gate !== undefined && params.acceptance !== undefined) throw new Error(label + " gate cannot be combined with acceptance; use one gate command or acceptance.verify.");
+  if (params.gate !== undefined && params.resume !== undefined) throw new Error(label + " gate is not supported with retained resume.");
+  if (params.resume !== undefined && (typeof params.resume !== "string" || !params.resume.trim())) throw new Error(label + " resume must be a non-empty retained run id.");
+  if (params.resume !== undefined && params.agent !== undefined) throw new Error(label + " resume and agent are mutually exclusive.");
+  if (params.resume !== undefined && (typeof params.task !== "string" || !params.task.trim())) throw new Error(label + " resume requires a non-empty task follow-up.");
   assertJsonValue(params, label + " params");
   const fingerprint = stableRunJson(params);
   const existing = fingerprints.get(key);
@@ -77,6 +83,20 @@ const runs = Object.freeze({
   },
 });
 
+function validateStateKey(key) {
+  if (typeof key !== "string" || !runKeyPattern.test(key)) throw new Error("state key must be 1-128 characters using letters, numbers, '.', '_' or '-', and start with a letter or number.");
+  return key;
+}
+
+const state = Object.freeze({
+  get(key) { return hostCall("state.get", { key: validateStateKey(key) }); },
+  set(key, value) {
+    const validKey = validateStateKey(key);
+    assertJsonValue(value, "state.set('" + validKey + "') value");
+    return hostCall("state.set", { key: validKey, value });
+  },
+});
+
 let contextObjectPrototype;
 
 const capturedConsole = Object.freeze(Object.fromEntries(
@@ -84,6 +104,17 @@ const capturedConsole = Object.freeze(Object.fromEntries(
     parentPort.postMessage({ type: "console", level, text: args.map((value) => typeof value === "string" ? value : inspect(value, { depth: 4, breakLength: 120 })).join(" ") });
   }]),
 ));
+
+function formatWorkflowScriptSyntaxError(error) {
+  const details = error && error.stack ? error.stack : String(error);
+  return [
+    "workflowScript must be valid JavaScript.",
+    "If task text contains Markdown fences or backticks, use an array joined with \"\\n\" or escaped strings instead of a raw backtick template literal.",
+    "",
+    "Original SyntaxError:",
+    details,
+  ].join("\n");
+}
 
 function assertJsonValue(value, path = "emit", seen = new Set()) {
   if (value === null || typeof value === "string" || typeof value === "boolean") return;
@@ -108,6 +139,25 @@ function assertJsonValue(value, path = "emit", seen = new Set()) {
   seen.delete(value);
 }
 
+function isPlainWorkflowObject(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === null || prototype === Object.prototype || prototype === contextObjectPrototype;
+}
+
+function omitUndefinedWorkflowValues(value, seen = new Set()) {
+  if (value === null || typeof value !== "object") return value;
+  if (seen.has(value)) return value;
+  seen.add(value);
+  const normalized = Array.isArray(value)
+    ? value.map((entry) => entry === undefined ? null : omitUndefinedWorkflowValues(entry, seen))
+    : isPlainWorkflowObject(value) && Object.getOwnPropertySymbols(value).length === 0
+      ? Object.fromEntries(Object.entries(value).flatMap(([key, entry]) => entry === undefined ? [] : [[key, omitUndefinedWorkflowValues(entry, seen)]]))
+      : value;
+  seen.delete(value);
+  return normalized;
+}
+
 parentPort.on("message", async (message) => {
   if (message.type === "response") {
     const entry = pending.get(message.callId);
@@ -120,11 +170,19 @@ parentPort.on("message", async (message) => {
   if (message.type !== "start") return;
   try {
     const sandbox = { runs, emit(value) { assertJsonValue(value); parentPort.postMessage({ type: "emit", value }); }, console: capturedConsole };
+    if (message.stateEnabled) sandbox.state = state;
     const context = vm.createContext(sandbox, { codeGeneration: { strings: false, wasm: false } });
     contextObjectPrototype = vm.runInContext("Object.prototype", context);
-    const compiled = new vm.Script("(async () => {\n" + message.script + "\n})()", { filename: "workflow-script.js" });
+    let compiled;
+    try {
+      compiled = new vm.Script("(async () => {\n" + message.script + "\n})()", { filename: "workflow-script.js" });
+    } catch (error) {
+      if (!(error instanceof SyntaxError)) throw error;
+      parentPort.postMessage({ type: "error", error: formatWorkflowScriptSyntaxError(error) });
+      return;
+    }
     const value = await compiled.runInContext(context);
-    const persistedValue = value === undefined ? null : value;
+    const persistedValue = value === undefined ? null : omitUndefinedWorkflowValues(value);
     assertJsonValue(persistedValue, "return");
     parentPort.postMessage({ type: "complete", value: persistedValue });
   } catch (error) {
@@ -175,10 +233,14 @@ export class WorkflowScriptError extends Error {
 
 export interface RunWorkflowScriptOptions {
 	script: string;
-	timeoutMs: number;
+	timeoutMs?: number;
 	signal?: AbortSignal;
 	launch: (key: string, params: Record<string, unknown>, signal: AbortSignal) => Promise<WorkflowScriptChildResult>;
 	status: (keyOrRunId: string, signal: AbortSignal) => Promise<WorkflowScriptChildResult>;
+	state?: {
+		get: (key: string) => unknown | Promise<unknown>;
+		set: (key: string, value: unknown) => void | Promise<void>;
+	};
 	onTrace?: (trace: WorkflowScriptTraceEntry[]) => void;
 	onEmit?: (emits: unknown[]) => void;
 }
@@ -239,15 +301,39 @@ export function formatWorkflowJsonPreview(value: unknown, maxLength: number): st
 	}
 }
 
+export interface SimpleWorkflowRunPreview {
+	agent?: string;
+	task?: string;
+}
+
+/** Display-only preview for the exact simple `return runs.run(key, {...})` form. */
+export function previewSimpleWorkflowRun(script: string | undefined): SimpleWorkflowRunPreview | undefined {
+	const body = script?.match(/^\s*return\s+(?:await\s+)?runs\.run\s*\(\s*(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`[^`$\\]*`)\s*,\s*\{([\s\S]*)\}\s*\)\s*;?\s*$/)?.[1];
+	if (body === undefined) return undefined;
+	const readProperty = (name: "agent" | "task"): string | undefined => {
+		const match = body.match(new RegExp(`(?:^|,)\\s*(?:${name}|["']${name}["'])\\s*:\\s*("(?:\\\\.|[^"\\\\])*"|'(?:\\\\.|[^'\\\\])*'|\u0060[^\u0060$\\\\]*\u0060)`));
+		if (!match?.[1]) return undefined;
+		const literal = match[1];
+		if (literal.startsWith('"')) {
+			try { return JSON.parse(literal) as string; } catch { return undefined; }
+		}
+		if (literal.slice(1, -1).includes("\\")) return undefined;
+		return literal.slice(1, -1);
+	};
+	const agent = readProperty("agent");
+	const task = readProperty("task");
+	return { ...(agent !== undefined ? { agent } : {}), ...(task !== undefined ? { task } : {}) };
+}
+
 function stableJson(value: unknown): string {
 	if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
 	if (isRecord(value)) return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableJson(value[key])}`).join(",")}}`;
 	return JSON.stringify(value) ?? "undefined";
 }
 
-function validateKey(value: unknown): string {
+function validateKey(value: unknown, owner = "runs.run"): string {
 	if (typeof value !== "string" || !KEY_PATTERN.test(value)) {
-		throw new Error("runs.run key must be 1-128 characters using letters, numbers, '.', '_' or '-', and start with a letter or number.");
+		throw new Error(`${owner} key must be 1-128 characters using letters, numbers, '.', '_' or '-', and start with a letter or number.`);
 	}
 	return value;
 }
@@ -261,7 +347,7 @@ function workflowStringMetadata(params: Record<string, unknown>): Pick<WorkflowS
 
 export async function runWorkflowScript(options: RunWorkflowScriptOptions): Promise<WorkflowScriptResult> {
 	if (!options.script.trim()) throw new Error("workflowScript must not be empty.");
-	if (!Number.isInteger(options.timeoutMs) || options.timeoutMs < 1) throw new Error("workflow script timeout must be a positive integer.");
+	if (options.timeoutMs !== undefined && (!Number.isInteger(options.timeoutMs) || options.timeoutMs < 1)) throw new Error("workflow script timeout must be a positive integer.");
 
 	const worker = new Worker(WORKER_SOURCE, { eval: true });
 	const emits: unknown[] = [];
@@ -283,7 +369,7 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 		const finish = (outcome: { value: unknown } | { error: Error }) => {
 			if (settled) return;
 			settled = true;
-			clearTimeout(timer);
+			if (timer) clearTimeout(timer);
 			options.signal?.removeEventListener("abort", onAbort);
 			void worker.terminate();
 			childController.abort("error" in outcome ? outcome.error : new Error("Workflow script completed; unawaited child launches are aborted."));
@@ -291,7 +377,9 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 			else resolve({ value: outcome.value, ...partial() });
 		};
 		const onAbort = () => finish({ error: new Error("Workflow script aborted.") });
-		const timer = setTimeout(() => finish({ error: new Error(`Workflow script timed out after ${options.timeoutMs}ms.`) }), options.timeoutMs);
+		const timer = options.timeoutMs === undefined
+			? undefined
+			: setTimeout(() => finish({ error: new Error(`Workflow script timed out after ${options.timeoutMs}ms.`) }), options.timeoutMs);
 		options.signal?.addEventListener("abort", onAbort, { once: true });
 		if (options.signal?.aborted) return onAbort();
 
@@ -332,12 +420,34 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 			if (message.type === "error") return finish({ error: new Error(typeof message.error === "string" ? message.error : "Workflow script failed.") });
 			if (message.type !== "call" || typeof message.callId !== "number" || typeof message.method !== "string" || !isRecord(message.args)) return;
 
-			const respond = (promise: Promise<WorkflowScriptChildResult>) => {
+			const respond = (promise: Promise<unknown>) => {
 				void promise.then(
-					(value) => worker.postMessage({ type: "response", callId: message.callId, ok: true, value: omitUndefinedWorkflowValues(value) }),
-					(error: unknown) => worker.postMessage({ type: "response", callId: message.callId, ok: false, error: error instanceof Error ? error.message : String(error) }),
+					(value) => {
+						if (!settled) worker.postMessage({ type: "response", callId: message.callId, ok: true, value: omitUndefinedWorkflowValues(value) });
+					},
+					(error: unknown) => {
+						if (!settled) worker.postMessage({ type: "response", callId: message.callId, ok: false, error: error instanceof Error ? error.message : String(error) });
+					},
 				);
 			};
+
+			if (message.method === "state.get" || message.method === "state.set") {
+				if (!options.state) return respond(Promise.reject(new Error("Workflow state is unavailable without a mission.")));
+				let key: string;
+				try {
+					key = validateKey(message.args.key, "state");
+				} catch (error) {
+					return respond(Promise.reject(error));
+				}
+				if (message.method === "state.get") return respond(Promise.resolve().then(() => options.state!.get(key)));
+				const value = message.args.value;
+				try {
+					assertWorkflowJsonValue(value, `state.set('${key}') value`);
+				} catch (error) {
+					return respond(Promise.reject(error));
+				}
+				return respond(Promise.resolve().then(() => options.state!.set(key, value)));
+			}
 
 			if (message.method === "status") {
 				const keyOrRunId = message.args.keyOrRunId;
@@ -366,11 +476,29 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 			if (!isRecord(params)) return respond(Promise.reject(new Error(`runs.run('${key}', params) requires a params object.`)));
 			if (params.action !== undefined) return respond(Promise.reject(new Error(`runs.run('${key}') accepts execution params only; management action is not allowed.`)));
 			if (params.workflowScript !== undefined) return respond(Promise.reject(new Error(`runs.run('${key}') cannot start a nested workflow script.`)));
-			if (params.tasks !== undefined || params.chain !== undefined || params.concurrency !== undefined || params.chainDir !== undefined) {
+			if (params.tasks !== undefined || params.chain !== undefined || params.parallel !== undefined || params.concurrency !== undefined || params.chainDir !== undefined) {
 				return respond(Promise.reject(new Error(`runs.run('${key}') accepts one child via { agent, task }; use runs.all(...) and JavaScript control flow for orchestration.`)));
 			}
 			if (params.worktree !== undefined && typeof params.worktree !== "boolean") {
 				return respond(Promise.reject(new Error(`runs.run('${key}') worktree must be true or false.`)));
+			}
+			if (params.gate !== undefined && (typeof params.gate !== "string" || !params.gate.trim())) {
+				return respond(Promise.reject(new Error(`runs.run('${key}') gate must be a non-empty command string.`)));
+			}
+			if (params.gate !== undefined && params.acceptance !== undefined) {
+				return respond(Promise.reject(new Error(`runs.run('${key}') gate cannot be combined with acceptance; use one gate command or acceptance.verify.`)));
+			}
+			if (params.gate !== undefined && params.resume !== undefined) {
+				return respond(Promise.reject(new Error(`runs.run('${key}') gate is not supported with retained resume.`)));
+			}
+			if (params.resume !== undefined && (typeof params.resume !== "string" || !params.resume.trim())) {
+				return respond(Promise.reject(new Error(`runs.run('${key}') resume must be a non-empty retained run id.`)));
+			}
+			if (params.resume !== undefined && params.agent !== undefined) {
+				return respond(Promise.reject(new Error(`runs.run('${key}') resume and agent are mutually exclusive.`)));
+			}
+			if (params.resume !== undefined && (typeof params.task !== "string" || !params.task.trim())) {
+				return respond(Promise.reject(new Error(`runs.run('${key}') resume requires a non-empty task follow-up.`)));
 			}
 			const collectFailure = message.args.collectFailure === true;
 			const deliver = (promise: Promise<WorkflowScriptChildResult>) => collectFailure
@@ -410,6 +538,6 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 			respond(deliver(promise));
 		});
 
-		worker.postMessage({ type: "start", script: options.script });
+		worker.postMessage({ type: "start", script: options.script, stateEnabled: options.state !== undefined });
 	});
 }

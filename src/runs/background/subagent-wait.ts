@@ -46,7 +46,7 @@ import {
 	type BackgroundWorkSnapshot,
 	type RegisteredBackgroundWorkItem,
 } from "../../api/background-work.ts";
-import { listAsyncRuns, type AsyncRunSummary } from "./async-status.ts";
+import { formatAsyncRunList, listAsyncRuns, type AsyncRunSummary } from "./async-status.ts";
 import {
 	DIRS,
 	INTERCOM_DETACH_REQUEST_EVENT,
@@ -58,8 +58,11 @@ import {
 	type Details,
 	type ForegroundResumeRun,
 	type SubagentState,
+	type WaitCompletion,
 } from "../../shared/types.ts";
-import { formatDuration } from "../../shared/formatters.ts";
+import { formatDuration, shortenPath } from "../../shared/formatters.ts";
+import { collectWaitCompletions } from "./wait-completions.ts";
+import { formatResumeFirstFailedRunsNote } from "./resume-guidance.ts";
 export { WAIT_TOOL_ENABLED_ENV, resolveWaitToolConfig, type ResolvedWaitToolConfig } from "./wait-config.ts";
 
 /** States that mean a run is still in flight (not yet resolved). */
@@ -303,12 +306,35 @@ function summarizeTerminalRuns(runs: AsyncRunSummary[], providerFinishedCount = 
 	return parts.join(", ");
 }
 
-function result(text: string, isError = false): AgentToolResult<Details> {
+function result(text: string, isError = false, completions?: WaitCompletion[]): AgentToolResult<Details> {
 	return {
 		content: [{ type: "text", text }],
 		...(isError ? { isError: true } : {}),
-		details: { mode: "management", results: [] },
+		details: {
+			mode: "management",
+			results: [],
+			...(completions && completions.length > 0 ? { completions } : {}),
+		},
 	};
+}
+
+/** Build the live status shown while async work keeps subagent_wait blocked. */
+function asyncWaitUpdate(runs: AsyncRunSummary[], providerCount: number, elapsedMs: number): AgentToolResult<Details> {
+	const activity = runs.flatMap((run) => {
+		const activeSteps = run.steps.filter((step) => step.status === "pending" || step.status === "running");
+		if (activeSteps.length === 0) {
+			return [`${run.id}: ${run.state}`];
+		}
+		return activeSteps.map((step) => {
+			const current = step.currentTool ?? (step.status === "pending" ? "queued" : "thinking…");
+			return `${step.agent}: ${current}${step.currentPath ? ` ${shortenPath(step.currentPath)}` : ""}`;
+		});
+	});
+	const headline = [
+		`Waiting ${formatDuration(elapsedMs)} for ${runs.length} async run(s) and ${providerCount} provider item(s).`,
+		...activity,
+	].join(" · ");
+	return result([headline, runs.length > 0 ? formatAsyncRunList(runs) : ""].filter(Boolean).join("\n"));
 }
 
 const TRANSCRIPT_TAIL_BYTES = 128 * 1024;
@@ -549,6 +575,7 @@ export async function waitForSubagents(
 			...activeInitialRuns.map((run) => `${run.id} (${run.state})`),
 			...activeInitialProviderItems.map((item) => `${item.provider}/${item.id}`),
 		].join(", ");
+		deps.onUpdate?.(asyncWaitUpdate(activeInitialRuns, activeInitialProviderItems.length, now() - startedAt));
 		if (signal?.aborted) {
 			return result(`Wait aborted after ${formatDuration(now() - startedAt)}. Still active: ${stillActive}.`, true);
 		}
@@ -577,6 +604,8 @@ export async function waitForSubagents(
 	let terminalSummary: string;
 	let finishedAsyncCount: number;
 	let failedAsyncCount: number;
+	let completions: WaitCompletion[] | undefined;
+	let resumeGuidance = "";
 	const activeProviderIds = new Set(providerActive.map(backgroundWorkIdentity));
 	const providerFinishedCount = [...initialProviderIds].filter((id) => !activeProviderIds.has(id)).length;
 	try {
@@ -585,6 +614,8 @@ export async function waitForSubagents(
 		finishedAsyncCount = terminal.length;
 		failedAsyncCount = terminal.filter((run) => run.state === "failed").length;
 		terminalSummary = summarizeTerminalRuns(terminal, providerFinishedCount);
+		resumeGuidance = formatResumeFirstFailedRunsNote(terminal);
+		completions = collectWaitCompletions(terminal, deps.state, deps.resultsDir ?? DIRS.results);
 	} catch (error) {
 		return result(error instanceof Error ? error.message : String(error), true);
 	}
@@ -609,8 +640,9 @@ export async function waitForSubagents(
 				: `${initialAsyncIds.size} async run(s) and ${initialProviderIds.size} provider item(s)`;
 		const status = relevantAttention.length > 0 ? "attention required" : "done";
 		return result(
-			`Waited ${elapsed} for ${scope}; ${status}.${outcome}${attentionNote} Completion/control events have been observed; inspect status if a notification is not visible yet.`,
+			`Waited ${elapsed} for ${scope}; ${status}.${outcome}${resumeGuidance}${attentionNote} Completion/control events have been observed; inspect status if a notification is not visible yet.`,
 			deps.failOnFailedRuns === true && failedAsyncCount > 0,
+			completions,
 		);
 	}
 
@@ -625,7 +657,8 @@ export async function waitForSubagents(
 		? `${relevantAttention.length} of ${initialCount} ${subject} need attention`
 		: `${finishedCount} of ${initialCount} ${subject} finished`;
 	return result(
-		`Waited ${elapsed}; ${progress}.${outcome}${attentionNote}${remainder} Relevant completion/control events have been observed; inspect status if a notification is not visible yet.`,
+		`Waited ${elapsed}; ${progress}.${outcome}${resumeGuidance}${attentionNote}${remainder} Relevant completion/control events have been observed; inspect status if a notification is not visible yet.`,
 		deps.failOnFailedRuns === true && failedAsyncCount > 0,
+		completions,
 	);
 }

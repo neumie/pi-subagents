@@ -337,13 +337,12 @@ describe("parallel agent execution", { skip: !piAvailable ? "pi packages not ava
 		}
 	});
 
-	it("treats parallel action aliases with tasks as top-level parallel execution", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+	it("rejects removed parallel action aliases with tasks at the public boundary", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
 		for (const action of ["parallel", "PARALLEL", "tasks"]) {
 			mockPi.reset();
-			mockPi.onCall({ output: `${action} alias finished` });
 			const executor = makeExecutor();
 
-			const result = await executor.execute(
+			const result = await executor.executePublic(
 				`parallel-alias-${action}`,
 				{ action, tasks: [{ agent: "echo", task: `Run ${action}` }] },
 				new AbortController().signal,
@@ -351,9 +350,9 @@ describe("parallel agent execution", { skip: !piAvailable ? "pi packages not ava
 				makeMinimalCtx(tempDir),
 			);
 
-			assert.equal(result.isError, undefined);
-			assert.equal(result.details?.mode, "parallel");
-			assert.match(result.content[0]?.text ?? "", new RegExp(`${action} alias finished`));
+			assert.equal(result.isError, true);
+			assert.match(result.content[0]?.text ?? "", /Legacy top-level chain and parallel inputs were removed/);
+			assert.equal(mockPi.callCount(), 0);
 		}
 	});
 

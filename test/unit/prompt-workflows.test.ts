@@ -91,11 +91,22 @@ Review $1 with $ARGUMENTS
 
 		assert.equal(sent.length, 0);
 		assert.equal(runs.length, 1);
-		assert.equal(runs[0]?.agent, "reviewer");
-		assert.equal(runs[0]?.model, "anthropic/claude-sonnet-4");
-		assert.deepEqual(runs[0]?.skill, ["deslop", "typescript-code"]);
-		assert.equal(runs[0]?.context, "fork");
-		assert.equal(runs[0]?.task, "Review target with target");
+		const params = runs[0];
+		assert.equal(params?.agent, undefined);
+		assert.equal(params?.task, undefined);
+		assert.equal(params?.clarify, undefined);
+		assert.equal(params?.model, undefined);
+		assert.equal(params?.skill, undefined);
+		assert.equal(params?.context, undefined);
+		assert.equal(params?.agentScope, "both");
+		assert.equal(params?.async, false);
+		const script = params?.workflowScript ?? "";
+		assert.match(script, /runs\.run\("prompt-1-native-run"/);
+		assert.match(script, /"agent":"reviewer"/);
+		assert.match(script, /"model":"anthropic\/claude-sonnet-4"/);
+		assert.match(script, /"skill":\["deslop","typescript-code"\]/);
+		assert.match(script, /"context":"fork"/);
+		assert.match(script, /Review target with target/);
 	});
 
 	it("runs declared prompt sequences through workflowScript", async () => {
@@ -125,9 +136,15 @@ Fix from {previous}: $@
 		await commands.get("prompt-workflow")!.handler("native-analyze bug report", makeCtx(cwd));
 
 		assert.equal(runs.length, 1);
-		assert.match(runs[0]?.workflowScript ?? "", /runs\.run\("prompt-1-native-analyze"/);
-		assert.match(runs[0]?.workflowScript ?? "", /runs\.run\("prompt-2-native-fix"/);
-		assert.match(runs[0]?.workflowScript ?? "", /replaceAll\("\{previous\}"/);
+		const params = runs[0];
+		assert.equal(params?.agent, undefined);
+		assert.equal(params?.task, undefined);
+		assert.equal(params?.clarify, undefined);
+		assert.equal(params?.agentScope, "both");
+		assert.equal(params?.async, false);
+		assert.match(params?.workflowScript ?? "", /runs\.run\("prompt-1-native-analyze"/);
+		assert.match(params?.workflowScript ?? "", /runs\.run\("prompt-2-native-fix"/);
+		assert.match(params?.workflowScript ?? "", /replaceAll\("\{previous\}"/);
 		assert.equal(commands.has("chain-prompts"), false);
 	});
 });

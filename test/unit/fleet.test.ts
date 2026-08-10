@@ -35,6 +35,8 @@ function writeAsyncRun(root: string, input: {
 	lastUpdate?: number;
 	agents?: string[];
 	contexts?: Array<"fresh" | "fork">;
+	models?: string[];
+	thinking?: string[];
 	output?: string;
 	transcript?: Array<Record<string, unknown>>;
 }): string {
@@ -55,6 +57,8 @@ function writeAsyncRun(root: string, input: {
 		steps: agents.map((agent, index) => ({
 			agent,
 			...(input.contexts?.[index] ? { context: input.contexts[index] } : {}),
+			...(input.models?.[index] ? { model: input.models[index] } : {}),
+			...(input.thinking?.[index] ? { thinking: input.thinking[index] } : {}),
 			status: input.state === "complete" ? "complete" : input.state === "failed" ? "failed" : index === 0 ? "running" : "pending",
 			startedAt: 100,
 			...(index === 0 ? { sessionFile: path.join(asyncDir, `${agent}.jsonl`), ...(transcriptPath ? { transcriptPath } : {}) } : {}),
@@ -175,6 +179,32 @@ describe("native subagent fleet", () => {
 		}
 	});
 
+	it("shows async model and thinking metadata in the structured header", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fleet-model-thinking-"));
+		try {
+			writeAsyncRun(root, {
+				id: "model-thinking",
+				state: "running",
+				models: ["openai-codex/gpt-5.5"],
+				thinking: ["high"],
+			});
+			const component = new SubagentFleetComponent(
+				{ terminal: { rows: 32, columns: 100 }, requestRender() {} } as never,
+				theme as never,
+				stateForTest(),
+				() => {},
+				{ asyncDirRoot: root, resultsDir: path.join(root, "results"), refreshMs: 60_000, markdownTheme },
+			);
+			try {
+				assert.ok(component.render(100).some((line) => line.includes("gpt-5.5 · thinking high")));
+			} finally {
+				component.dispose();
+			}
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
 	it("shows a scripted workflow as one fleet parent instead of unrelated children", () => {
 		const state = stateForTest();
 		state.fleetJobs = new Map([["workflow-1", {
@@ -229,6 +259,21 @@ describe("native subagent fleet", () => {
 		assert.equal(snapshot.items[0]?.runId, "active-old");
 		assert.equal(snapshot.items.find((item) => item.runId === "terminal-21")?.state, "complete");
 		assert.ok(!snapshot.items.some((item) => item.runId === "terminal-0"));
+	});
+
+	it("uses the full 85% terminal-height budget for the inspector", () => {
+		const component = new SubagentFleetComponent(
+			{ terminal: { rows: 60, columns: 100 }, requestRender() {} } as never,
+			theme as never,
+			stateForTest(),
+			() => {},
+			{ refreshMs: 60_000 },
+		);
+		try {
+			assert.equal(component.render(100).length, 51);
+		} finally {
+			component.dispose();
+		}
 	});
 
 	it("renders selectable transcript detail and completed artifact paths within terminal width", () => {
@@ -671,7 +716,7 @@ describe("native subagent fleet", () => {
 		try {
 			const asyncDir = writeAsyncRun(root, { id: "async-steer", agents: ["worker", "reviewer"] });
 			const state = stateForTest();
-			const calls: Array<{ runId: string; asyncDir: string; index?: number; message: string }> = [];
+			const calls: Array<{ runId: string; asyncDir: string; index?: number; message: string; mode: string }> = [];
 			const component = new SubagentFleetComponent(
 				{ terminal: { rows: 28, columns: 100 }, requestRender() {} } as never,
 				theme as never,
@@ -695,11 +740,13 @@ describe("native subagent fleet", () => {
 			);
 			try {
 				component.handleInput("s");
-				assert.ok(component.render(100).some((line) => line.includes("Steer message:")));
+				assert.ok(component.render(100).some((line) => line.includes("Steer message (steer):")));
+				component.handleInput("\t");
+				assert.ok(component.render(100).some((line) => line.includes("Steer message (follow_up):")));
 				for (const char of "please continue") component.handleInput(char);
 				component.handleInput("\r");
 				await new Promise((resolve) => setImmediate(resolve));
-				assert.deepEqual(calls, [{ runId: "async-steer", asyncDir, index: 0, message: "please continue" }]);
+				assert.deepEqual(calls, [{ runId: "async-steer", asyncDir, index: 0, message: "please continue", mode: "follow_up" }]);
 				assert.ok(component.render(100).some((line) => line.includes("Steering queued.")));
 			} finally {
 				component.dispose();

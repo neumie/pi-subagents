@@ -209,6 +209,7 @@ describe("Herdr inspector", () => {
 			const splitCall = calls.find((args) => args[0] === "pane" && args[1] === "split");
 			assert.deepEqual(splitCall?.slice(0, 7), ["pane", "split", "--current", "--direction", "right", "--cwd", projectRoot]);
 			const runCall = calls.find((args) => args[0] === "pane" && args[1] === "run" && args[2] === "w1:p10");
+			assert.equal(runCall?.[3]?.startsWith("& "), process.platform === "win32");
 			assert.match(runCall?.[3] ?? "", /pi-bin/);
 			assert.match(runCall?.[3] ?? "", /Own this project mission\./);
 

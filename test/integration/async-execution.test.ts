@@ -1095,7 +1095,7 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		await waitForMockPiCall(mockPi, 1, 10_000);
 		const resultPath = await waitForAsyncResultFile(id, 8_000);
 		const payload = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as AsyncResultPayload;
-		const status = JSON.parse(fs.readFileSync(path.join(ASYNC_DIR, id, "status.json"), "utf-8")) as AsyncStatusPayload;
+		const status = await waitForAsyncState(id, (candidate) => candidate.state === "failed");
 		assert.equal(payload.state, "failed");
 		assert.equal(payload.success, false);
 		assert.equal(payload.exitCode, 1);
@@ -1140,7 +1140,7 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		const resultPath = await waitForAsyncResultFile(id, 10_000);
 		const elapsedMs = Date.now() - startedAt;
 		const payload = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as AsyncResultPayload;
-		const status = JSON.parse(fs.readFileSync(path.join(ASYNC_DIR, id, "status.json"), "utf-8")) as AsyncStatusPayload;
+		const status = await waitForAsyncState(id, (candidate) => candidate.state === "failed");
 		assert.equal(payload.state, "failed");
 		assert.equal(payload.timedOut, true);
 		assert.equal(payload.results[0]?.timedOut, true);
@@ -1182,7 +1182,7 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		const resultPath = await waitForAsyncResultFile(id, 5_000);
 		const elapsedMs = Date.now() - startedAt;
 		const payload = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as AsyncResultPayload;
-		const status = JSON.parse(fs.readFileSync(path.join(ASYNC_DIR, id, "status.json"), "utf-8")) as AsyncStatusPayload;
+		const status = await waitForAsyncState(id, (candidate) => candidate.state === "failed");
 		assert.equal(payload.state, "failed");
 		assert.equal(payload.timedOut, true);
 		assert.equal(payload.results[0]?.timedOut, true);
@@ -1218,7 +1218,7 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 
 		const resultPath = await waitForAsyncResultFile(id, 10_000);
 		const payload = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as AsyncResultPayload;
-		const status = JSON.parse(fs.readFileSync(path.join(ASYNC_DIR, id, "status.json"), "utf-8")) as AsyncStatusPayload;
+		const status = await waitForAsyncState(id, (candidate) => candidate.state === "complete");
 		assert.equal(payload.success, true);
 		assert.equal(payload.state, "complete");
 		assert.equal(payload.turnBudgetExceeded, undefined);
@@ -1257,7 +1257,7 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 
 		const resultPath = await waitForAsyncResultFile(id, 10_000);
 		const payload = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as AsyncResultPayload;
-		const status = JSON.parse(fs.readFileSync(path.join(ASYNC_DIR, id, "status.json"), "utf-8")) as AsyncStatusPayload;
+		const status = await waitForAsyncState(id, (candidate) => candidate.state === "complete");
 		assert.equal(payload.success, true);
 		assert.equal(payload.state, "complete");
 		assert.equal(payload.exitCode, 0);
@@ -1319,7 +1319,7 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 
 		const resultPath = await waitForAsyncResultFile(id, 10_000);
 		const payload = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as AsyncResultPayload;
-		const status = JSON.parse(fs.readFileSync(path.join(ASYNC_DIR, id, "status.json"), "utf-8")) as AsyncStatusPayload;
+		const status = await waitForAsyncState(id, (candidate) => candidate.state === "complete");
 		assert.equal(payload.state, "complete");
 		assert.equal(payload.turnBudgetExceeded, undefined);
 		assert.equal(payload.turnBudget?.outcome, "wrap-up-requested");
@@ -1361,7 +1361,7 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		deliverTimeoutRequest({ asyncDir, pid: pending.pid, source: "test" });
 		const resultPath = await waitForAsyncResultFile(id, 10_000);
 		const payload = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as AsyncResultPayload;
-		const status = JSON.parse(fs.readFileSync(path.join(asyncDir, "status.json"), "utf-8")) as AsyncStatusPayload;
+		const status = await waitForAsyncState(id, (candidate) => candidate.state === "failed");
 		assert.equal(payload.state, "failed");
 		assert.equal(payload.timedOut, true);
 		assert.equal(payload.turnBudgetExceeded, undefined);
@@ -1402,7 +1402,7 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		deliverStopRequest({ asyncDir, pid: pending.pid, source: "test" });
 		const resultPath = await waitForAsyncResultFile(id, 10_000);
 		const payload = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as AsyncResultPayload;
-		const status = JSON.parse(fs.readFileSync(path.join(asyncDir, "status.json"), "utf-8")) as AsyncStatusPayload;
+		const status = await waitForAsyncState(id, (candidate) => candidate.state === "stopped");
 		assert.equal(payload.state, "stopped");
 		assert.equal(payload.stopped, true);
 		assert.equal(payload.turnBudgetExceeded, undefined);
@@ -1934,7 +1934,7 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.ok(!result.isError);
 		const resultPath = await waitForAsyncResultFile(id, 10_000);
 		const payload = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as AsyncResultPayload;
-		const status = JSON.parse(fs.readFileSync(path.join(ASYNC_DIR, id, "status.json"), "utf-8")) as AsyncStatusPayload;
+		const status = await waitForAsyncState(id, (candidate) => candidate.state === "complete");
 		assert.deepEqual(payload.results[0]?.structuredOutput, { value: "Alpha structured" });
 		assert.deepEqual(payload.outputs?.data?.structured, { value: "Alpha structured" });
 		assert.match(readMockPiArgs(mockPi, 1).at(-1) ?? "", /Alpha structured/);
@@ -1983,7 +1983,7 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.ok(!result.isError, `should launch: ${JSON.stringify(result.content)}`);
 		const resultPath = await waitForAsyncResultFile(id, 10_000);
 		const payload = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as AsyncResultPayload;
-		const status = JSON.parse(fs.readFileSync(path.join(ASYNC_DIR, id, "status.json"), "utf-8")) as AsyncStatusPayload;
+		const status = await waitForAsyncState(id, (candidate) => candidate.state === "complete");
 		assert.equal(payload.success, true);
 		assert.deepEqual(payload.results.map((entry) => entry.output), [
 			"Scout A async findings",
@@ -2349,7 +2349,7 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		const resultPath = await waitForAsyncResultFile(id, 5_000);
 		const elapsedMs = Date.now() - startedAt;
 		const payload = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as AsyncResultPayload;
-		const status = JSON.parse(fs.readFileSync(path.join(ASYNC_DIR, id, "status.json"), "utf-8")) as AsyncStatusPayload;
+		const status = await waitForAsyncState(id, (candidate) => candidate.state === "failed");
 		const dynamicNode = payload.workflowGraph?.nodes?.[1] as { status?: string; error?: string; acceptanceStatus?: string } | undefined;
 		assert.equal(payload.state, "failed");
 		assert.equal(payload.timedOut, true);
@@ -2419,7 +2419,7 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.ok(!result.isError);
 		const resultPath = await waitForAsyncResultFile(id, 10_000);
 		const payload = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as AsyncResultPayload;
-		const status = JSON.parse(fs.readFileSync(path.join(ASYNC_DIR, id, "status.json"), "utf-8")) as AsyncStatusPayload & { workflowGraph?: AsyncResultPayload["workflowGraph"]; error?: string };
+		const status = await waitForAsyncState(id, (candidate) => candidate.state === "failed") as AsyncStatusPayload & { workflowGraph?: AsyncResultPayload["workflowGraph"]; error?: string };
 		assert.equal(payload.success, false);
 		assert.match(payload.results.at(-1)?.error ?? "", /exceeding maxItems 1/);
 		assert.equal(payload.workflowGraph?.nodes?.[1]?.status, "failed");
@@ -2497,7 +2497,7 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 			assert.ok(taskArg.includes(`Write your findings to exactly this path: ${path.join(repoDir, ".pi-subagents", "artifacts", "outputs", asyncId, "report.md")}`));
 			const resultPath = await waitForAsyncResultFile(asyncId, 90_000);
 			const payload = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as AsyncResultPayload;
-			const status = JSON.parse(fs.readFileSync(path.join(result.details!.asyncDir!, "status.json"), "utf-8")) as AsyncStatusPayload;
+			const status = await waitForAsyncState(asyncId, (candidate) => candidate.state === "complete");
 			assert.equal(payload.parallelHandoff?.version, 1);
 			assert.equal(payload.parallelHandoff?.path, path.join(result.details!.asyncDir!, "handoff.json"));
 			assert.deepEqual(status.parallelHandoff, payload.parallelHandoff);
@@ -2635,7 +2635,7 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.equal(payload.results[0].modelAttempts.length, 2);
 		assert.deepEqual(payload.results[0].totalCost, { inputTokens: 110, outputTokens: 55, costUsd: 0.011 });
 		assert.deepEqual(payload.totalCost, { inputTokens: 110, outputTokens: 55, costUsd: 0.011 });
-		const statusPayload = JSON.parse(fs.readFileSync(path.join(asyncDir, "status.json"), "utf-8")) as AsyncStatusPayload;
+		const statusPayload = await waitForAsyncState(id, (candidate) => candidate.state === "complete" && candidate.totalCost !== undefined);
 		assert.equal(statusPayload.lifecycleArtifactVersion, SUBAGENT_LIFECYCLE_ARTIFACT_VERSION);
 		assert.equal(statusPayload.steps[0]?.model, "anthropic/claude-sonnet-4:low");
 		assert.equal(statusPayload.steps[0]?.thinking, "low");
@@ -2942,7 +2942,6 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 			exitCode: 0,
 		});
 		const id = `async-zero-exit-provider-error-${Date.now().toString(36)}`;
-		const asyncDir = path.join(ASYNC_DIR, id);
 		executeAsyncSingle(id, {
 			agent: "worker",
 			task: "Do work",
@@ -2964,8 +2963,7 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		const payload = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as AsyncResultPayload;
 		assert.equal(payload.success, false);
 		assert.match(payload.results[0]?.error ?? "", /429 quota exceeded/);
-		const statusPayload = JSON.parse(fs.readFileSync(path.join(asyncDir, "status.json"), "utf-8")) as AsyncStatusPayload;
-		assert.equal(statusPayload.state, "failed");
+		const statusPayload = await waitForAsyncState(id, (status) => status.state === "failed");
 		assert.match(statusPayload.steps?.[0]?.error ?? "", /429 quota exceeded/);
 	});
 
@@ -3014,7 +3012,7 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.equal(payload.results[0]?.success, true);
 		assert.equal(payload.results[0]?.error, undefined);
 		assert.equal(payload.results[0]?.output, "Recovered asynchronously");
-		const statusPayload = JSON.parse(fs.readFileSync(path.join(asyncDir, "status.json"), "utf-8")) as AsyncStatusPayload;
+		const statusPayload = await waitForAsyncState(id, (candidate) => candidate.state === "complete");
 		assert.equal(statusPayload.state, "complete");
 		assert.equal(statusPayload.steps?.[0]?.status, "complete");
 		assert.equal(statusPayload.steps?.[0]?.exitCode, 0);
@@ -3064,7 +3062,7 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.equal(payload.results[0]?.success, false);
 		assert.match(payload.results[0]?.error ?? "", /provider transport failed/);
 		assert.equal(payload.results[0]?.output, "");
-		const statusPayload = JSON.parse(fs.readFileSync(path.join(asyncDir, "status.json"), "utf-8")) as AsyncStatusPayload;
+		const statusPayload = await waitForAsyncState(id, (candidate) => candidate.state === "failed");
 		assert.equal(statusPayload.state, "failed");
 		assert.equal(statusPayload.steps?.[0]?.status, "failed");
 		assert.equal(statusPayload.steps?.[0]?.exitCode, 1);
@@ -3343,7 +3341,7 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 
 		const resultPath = await waitForAsyncResultFile(id, 10_000);
 		const payload = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as AsyncResultPayload;
-		const statusPayload = JSON.parse(fs.readFileSync(path.join(ASYNC_DIR, id, "status.json"), "utf-8")) as AsyncStatusPayload;
+		const statusPayload = await waitForAsyncState(id, (candidate) => candidate.state === "complete");
 
 		assert.equal(payload.success, true);
 		assert.equal(payload.state, "complete");
@@ -3470,6 +3468,101 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.equal(payload.success, true);
 		assert.equal(payload.results[0].model, "github-copilot/gpt-5-mini");
 		assert.deepEqual(payload.results[0].attemptedModels, ["github-copilot/gpt-5-mini"]);
+	});
+
+	it("scheduled executor launches retain the live active session ownership", { skip: !isAsyncAvailable() || !createSubagentExecutor ? "jiti or executor not available" : undefined }, async () => {
+		mockPi.onCall({ output: "Scheduled work completed" });
+		const liveCwd = path.join(tempDir, "live-project");
+		fs.mkdirSync(liveCwd);
+		const state = {
+			baseCwd: liveCwd,
+			currentSessionId: "session-b",
+			lastParentModel: { provider: "deepseek", id: "live-model" },
+			subagentSpawns: { sessionId: "session-b", count: 1, configuredLimit: 1, granted: 1, grantHistory: [] },
+			asyncJobs: new Map(),
+			fleetJobs: new Map(),
+			foregroundControls: new Map(),
+			lastForegroundControlId: null,
+		};
+		const executor = createSubagentExecutor!({
+			pi: { events: createEventBus(), getSessionName: () => undefined },
+			state,
+			config: { maxSubagentSpawnsPerSession: 1 },
+			asyncByDefault: false,
+			tempArtifactsDir: tempDir,
+			getSubagentSessionRoot: () => path.join(tempDir, "sessions"),
+			expandTilde: (p: string) => p,
+			discoverAgents: () => ({ agents: [makeAgent("worker")] }),
+		});
+		const retainedCtx = makeMinimalCtx(tempDir);
+		retainedCtx.sessionManager.getSessionId = () => "session-a";
+		retainedCtx.model = { provider: "deepseek", id: "scheduled-model" };
+		const launch = await executor.executeScheduled(
+			`scheduled-owner-${Date.now().toString(36)}`,
+			{ agent: "worker", task: "Run retained project timer", async: true, acceptance: false },
+			new AbortController().signal,
+			retainedCtx,
+		) as AsyncExecutionResult;
+
+		assert.equal(launch.isError, undefined);
+		assert.ok(launch.details.asyncId);
+		assert.equal(state.currentSessionId, "session-b");
+		assert.equal(state.baseCwd, liveCwd);
+		assert.deepEqual(state.lastParentModel, { provider: "deepseek", id: "live-model" });
+		assert.deepEqual(state.subagentSpawns, { sessionId: "session-b", count: 1, configuredLimit: 1, granted: 1, grantHistory: [] });
+		const blocked = await executor.executeScheduled(
+			`scheduled-owner-blocked-${Date.now().toString(36)}`,
+			{ agent: "worker", task: "Exceed the retained owner budget", async: true, acceptance: false },
+			new AbortController().signal,
+			retainedCtx,
+		);
+		assert.equal(blocked.isError, true);
+		assert.match(blocked.content[0]?.type === "text" ? blocked.content[0].text : "", /1\/1 used/);
+		assert.deepEqual(state.subagentSpawns, { sessionId: "session-b", count: 1, configuredLimit: 1, granted: 1, grantHistory: [] });
+		await readAsyncPayload(launch.details.asyncId);
+	});
+
+	it("scheduled workflows keep owner status and registries isolated from the live session", { skip: !isAsyncAvailable() || !createSubagentExecutor ? "jiti or executor not available" : undefined }, async () => {
+		const liveCwd = path.join(tempDir, "live-workflow-project");
+		fs.mkdirSync(liveCwd);
+		const state = {
+			baseCwd: liveCwd,
+			currentSessionId: "session-b",
+			subagentSpawns: { sessionId: "session-b", count: 4, configuredLimit: 5, granted: 0, grantHistory: [] },
+			asyncJobs: new Map(),
+			fleetJobs: new Map(),
+			foregroundControls: new Map(),
+			lastForegroundControlId: null,
+		};
+		const executor = createSubagentExecutor!({
+			pi: { events: createEventBus(), getSessionName: () => undefined },
+			state,
+			config: { maxSubagentSpawnsPerSession: 5 },
+			asyncByDefault: false,
+			tempArtifactsDir: tempDir,
+			getSubagentSessionRoot: () => path.join(tempDir, "sessions"),
+			expandTilde: (p: string) => p,
+			discoverAgents: () => ({ agents: [makeAgent("worker")] }),
+		});
+		const retainedCtx = makeMinimalCtx(tempDir);
+		retainedCtx.sessionManager.getSessionId = () => "session-a";
+		const workflowId = `scheduled-workflow-${Date.now().toString(36)}`;
+		const launch = await executor.executeScheduled(
+			workflowId,
+			{ workflowScript: `return await runs.status("${workflowId}")`, async: true },
+			new AbortController().signal,
+			retainedCtx,
+		) as AsyncExecutionResult;
+
+		assert.equal(launch.isError, undefined);
+		assert.equal(state.asyncJobs.size, 0);
+		assert.equal(state.fleetJobs.size, 0);
+		assert.deepEqual(state.subagentSpawns, { sessionId: "session-b", count: 4, configuredLimit: 5, granted: 0, grantHistory: [] });
+		const payload = await readAsyncPayload(launch.details.asyncId);
+		assert.equal(state.asyncJobs.size, 0);
+		assert.equal(state.fleetJobs.size, 0);
+		assert.match(payload.workflow.value.output, /Spawn budget: 0\/5 used/);
+		assert.match(payload.workflow.value.output, new RegExp(workflowId));
 	});
 
 	it("async executor keeps the last parent session model after continuation drops ctx.model", { skip: !isAsyncAvailable() || !createSubagentExecutor ? "jiti or executor not available" : undefined }, async () => {

@@ -445,20 +445,15 @@ describe("public subagent delegation contract", () => {
 		settledBridge.dispose();
 	});
 
-	it("retains the unversioned prompt-template bridge as legacy fallback", async () => {
+	it("rejects the unversioned prompt-template direct delegation fallback", async () => {
 		const events = new FakeEvents();
-		let structuredCalls = 0;
-		let legacyCalls = 0;
+		let executeCalls = 0;
 		const bridge = registerPromptTemplateDelegationBridge({
 			events,
 			getContext: () => ({ cwd: "/repo" }),
 			execute: async () => {
-				legacyCalls++;
-				return { content: [{ type: "text", text: "legacy done" }], details: { mode: "single", results: [{ agent: "reviewer", finalOutput: "legacy done", exitCode: 0 }] } };
-			},
-			executeStructured: async () => {
-				structuredCalls++;
-				return { details: { mode: "single", results: [] } };
+				executeCalls++;
+				return { content: [{ type: "text", text: "unreachable" }], details: { mode: "single", results: [] } };
 			},
 		});
 		const responsePromise = once(events, SUBAGENT_DELEGATION_RESPONSE_EVENT);
@@ -470,12 +465,11 @@ describe("public subagent delegation contract", () => {
 			model: "openai/gpt-5",
 			cwd: "/repo",
 		});
-		const response = await responsePromise as { requestId: string; isError: boolean; contentText?: string };
+		const response = await responsePromise as { requestId: string; isError: boolean; errorText?: string };
 		assert.equal(response.requestId, "legacy-1");
-		assert.equal(response.isError, false);
-		assert.equal(response.contentText, "legacy done");
-		assert.equal(legacyCalls, 1);
-		assert.equal(structuredCalls, 0);
+		assert.equal(response.isError, true);
+		assert.match(response.errorText ?? "", /Legacy prompt-template direct delegation was removed/);
+		assert.equal(executeCalls, 0);
 		bridge.dispose();
 	});
 });

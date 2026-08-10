@@ -30,7 +30,7 @@ describe("mission launch lifecycle", () => {
 			});
 			assert.ok(binding);
 			const mission = readMission(binding.location, binding.missionId);
-			assert.equal(mission.goal, "Map the auth flow");
+			assert.equal(mission.objective, "Map the auth flow");
 			assert.equal(mission.status, "active");
 			const result = attachMissionToLaunchResult({
 				binding,
@@ -52,6 +52,20 @@ describe("mission launch lifecycle", () => {
 			});
 			assert.equal(disabled, undefined);
 
+			const parallelOnly = prepareMissionLaunch({
+				params: { chain: [{ parallel: [{ task: "" }, { task: "Review parallel work" }] }] },
+				projectRoot: test.projectRoot,
+				config: test.missionConfig,
+			});
+			assert.ok(parallelOnly);
+			assert.equal(readMission(parallelOnly.location, parallelOnly.missionId).objective, "Review parallel work");
+
+			assert.throws(() => prepareMissionLaunch({
+				params: { missionId: "" },
+				projectRoot: test.projectRoot,
+				config: test.missionConfig,
+			}), /missionId/);
+
 			const perLaunchDisabled = prepareMissionLaunch({
 				params: { mission: false, task: "Ephemeral check" },
 				projectRoot: test.projectRoot,
@@ -71,6 +85,17 @@ describe("mission launch lifecycle", () => {
 				config: { ...test.missionConfig, enabled: false },
 			});
 			assert.ok(explicit);
+			assert.equal(readMission(explicit.location, explicit.missionId).objective, "Tiny one-off");
+
+			const summaryAlias = prepareMissionLaunch({
+				params: { mission: { summary: "Review active backlog", labels: ["review"] }, task: "Review the current diff" },
+				projectRoot: test.projectRoot,
+				config: test.missionConfig,
+			});
+			assert.ok(summaryAlias);
+			assert.deepEqual(readMission(summaryAlias.location, summaryAlias.missionId).labels, ["review"]);
+			assert.equal(readMission(summaryAlias.location, summaryAlias.missionId).title, "Review active backlog");
+			assert.equal(readMission(summaryAlias.location, summaryAlias.missionId).objective, "Review the current diff");
 		} finally {
 			fs.rmSync(test.root, { recursive: true, force: true });
 		}
@@ -80,7 +105,7 @@ describe("mission launch lifecycle", () => {
 		const test = projectFixture();
 		try {
 			const binding = prepareMissionLaunch({
-				params: { mission: { title: "Implement feature", goal: "Ship it", labels: ["phase-1"] }, task: "Do the work" },
+				params: { mission: { title: "Implement feature", objective: "Ship it", labels: ["phase-1"] }, task: "Do the work" },
 				projectRoot: test.projectRoot,
 				config: test.missionConfig,
 				ownerSessionId: "session-1",
@@ -176,7 +201,7 @@ describe("mission launch lifecycle", () => {
 		}
 	});
 
-	it("binds an async launch and reconciles terminal status and artifacts", () => {
+	it("binds an async workflow launch and preserves its mode through completion", () => {
 		const test = projectFixture();
 		try {
 			const asyncDir = path.join(test.root, "async-run");
@@ -191,7 +216,7 @@ describe("mission launch lifecycle", () => {
 				binding,
 				result: {
 					content: [{ type: "text", text: "Async started" }],
-					details: { mode: "chain", runId: "async-1", asyncId: "async-1", asyncDir, results: [] },
+					details: { mode: "workflow", runId: "async-1", asyncId: "async-1", asyncDir, results: [] },
 				},
 			});
 			assert.equal(readMissionBinding(asyncDir)?.missionId, binding.missionId);
@@ -201,7 +226,7 @@ describe("mission launch lifecycle", () => {
 				id: "async-1",
 				runId: "async-1",
 				asyncDir,
-				mode: "chain",
+				mode: "workflow",
 				state: "complete",
 				success: true,
 				summary: "Background work completed",
@@ -209,6 +234,7 @@ describe("mission launch lifecycle", () => {
 			});
 			assert.equal(completed?.status, "completed");
 			assert.equal(completed?.runs[0]?.status, "complete");
+			assert.equal(completed?.runs[0]?.mode, "workflow");
 			assert.ok(completed?.artifacts.some((artifact) => artifact.kind === "output"));
 		} finally {
 			fs.rmSync(test.root, { recursive: true, force: true });

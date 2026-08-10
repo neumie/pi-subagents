@@ -61,6 +61,25 @@ test("truncLine respects grapheme display width", () => {
 	assert.equal(visibleWidth(rendered), 5);
 });
 
+test("truncLine emits no marker at zero width", () => {
+	assert.equal(truncLine("abcdef", 0), "");
+});
+
+test("multiline rendering omits two-column graphemes at one-column width", () => {
+	const originalColumns = Object.getOwnPropertyDescriptor(process.stdout, "columns");
+	Object.defineProperty(process.stdout, "columns", { configurable: true, value: 5 });
+	try {
+		const rendered = componentText(renderSubagentResult({
+			content: [{ type: "text", text: "a🙂b\n🙂" }],
+		}, { expanded: true }, theme as any));
+		assert.deepEqual(rendered.split("\n"), ["a", "b"]);
+		for (const line of rendered.split("\n")) assert.ok(visibleWidth(line) <= 1);
+	} finally {
+		if (originalColumns) Object.defineProperty(process.stdout, "columns", originalColumns);
+		else delete (process.stdout as { columns?: number }).columns;
+	}
+});
+
 test("compact chain rendering uses workflow graph spans for dynamic fanout results", () => {
 	const component = renderSubagentResult({
 		content: [{ type: "text", text: "done" }],

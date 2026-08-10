@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { Details } from "../shared/types.ts";
 
-export const WORKFLOW_CHAT_PROGRESS_MODES = ["auto", "off", "terminal", "milestones", "live-card"] as const;
+export const WORKFLOW_CHAT_PROGRESS_MODES = ["auto", "off", "live-card"] as const;
 export type WorkflowChatProgressMode = typeof WORKFLOW_CHAT_PROGRESS_MODES[number];
 export type ResolvedWorkflowChatProgressMode = Exclude<WorkflowChatProgressMode, "auto">;
 
@@ -86,7 +86,7 @@ export function resolveWorkflowChatProgress(input: ResolveWorkflowChatProgressIn
 
 	const requestedMode = requested.mode ?? "auto";
 	let mode: ResolvedWorkflowChatProgressMode;
-	if (requestedMode === "auto") mode = sameRepo ? (input.background ? "milestones" : "live-card") : "terminal";
+	if (requestedMode === "auto") mode = sameRepo && !input.background ? "live-card" : "off";
 	else mode = requestedMode;
 
 	if (mode === "live-card" && !sameRepo) return { error: "chatProgress: 'live-card' is only available for workflowScript runs in the same Git repository." };

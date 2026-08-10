@@ -2,6 +2,11 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { keyText } from "@earendil-works/pi-coding-agent";
 
+type RenderTheme = {
+	fg(name: string, text: string): string;
+	bold(text: string): string;
+};
+
 type RenderSubagentResult = (
 	result: {
 		content: Array<{ type: "text"; text: string }>;
@@ -13,15 +18,23 @@ type RenderSubagentResult = (
 		};
 	},
 	options: { expanded: boolean },
-	theme: {
-		fg(name: string, text: string): string;
-		bold(text: string): string;
+	theme: RenderTheme,
+) => { render(width: number): string[] };
+
+type RenderSubagentSummary = (
+	result: {
+		content: Array<{ type: "text"; text: string }>;
+		details?: { mode: "single" | "parallel" | "chain" | "management"; results: unknown[]; progress?: unknown[]; asyncId?: string };
 	},
+	options: { isPartial?: boolean },
+	theme: RenderTheme,
 ) => { render(width: number): string[] };
 
 let renderSubagentResult: RenderSubagentResult | undefined;
-({ renderSubagentResult } = await import("../../src/tui/render.ts") as {
+let renderSubagentSummary: RenderSubagentSummary | undefined;
+({ renderSubagentResult, renderSubagentSummary } = await import("../../src/tui/render.ts") as {
 	renderSubagentResult?: RenderSubagentResult;
+	renderSubagentSummary?: RenderSubagentSummary;
 });
 
 const theme = {
@@ -365,6 +378,312 @@ describe("renderSubagentResult fork indicator", () => {
 		assert.match(unwrap(expanded), /precisefailingtoolsequenceattheend\./);
 	});
 
+	it("uses the same semantic status presentation in compact and expanded single results", () => {
+		const cases = [
+			{
+				name: "running",
+				glyph: "⠋",
+				label: "running",
+				extra: { progress: { index: 0, agent: "reviewer", status: "running", task: "review", recentTools: [], recentOutput: [], toolCount: 0, tokens: 0, durationMs: 0 } },
+			},
+			{
+				name: "detached",
+				glyph: "■",
+				label: "detached",
+				extra: {
+					detached: true,
+					detachedReason: "continuing externally",
+					progress: { index: 0, agent: "reviewer", status: "running", task: "review", recentTools: [], recentOutput: [], toolCount: 1, tokens: 42, durationMs: 1000 },
+				},
+			},
+			{
+				name: "stopped",
+				glyph: "■",
+				label: "stopped",
+				extra: {
+					stopped: true,
+					exitCode: 1,
+					progress: { index: 0, agent: "reviewer", status: "running", task: "review", recentTools: [], recentOutput: [], toolCount: 1, tokens: 42, durationMs: 1000 },
+				},
+			},
+			{
+				name: "interrupted",
+				glyph: "■",
+				label: "paused",
+				extra: {
+					interrupted: true,
+					exitCode: 1,
+					progress: { index: 0, agent: "reviewer", status: "running", task: "review", recentTools: [], recentOutput: [], toolCount: 1, tokens: 42, durationMs: 1000 },
+				},
+			},
+			{ name: "failed", glyph: "✗", label: "failed", extra: { exitCode: 1, error: "boom" } },
+			{ name: "completed", glyph: "✓", label: "completed", extra: {} },
+		] as const;
+
+		for (const testCase of cases) {
+			const child = {
+				agent: "reviewer",
+				task: "review",
+				exitCode: 0,
+				finalOutput: "review complete",
+				messages: [],
+				usage: emptyUsage,
+				...testCase.extra,
+			};
+			const result = {
+				content: [{ type: "text" as const, text: testCase.name }],
+				details: { mode: "single" as const, results: [child] },
+			};
+			const compact = renderSubagentResult!(result, { expanded: false }, theme).render(120).join("\n");
+			const expanded = renderSubagentResult!(result, { expanded: true }, theme).render(120).join("\n");
+
+			assert.equal(firstGrapheme(compact), testCase.glyph, `${testCase.name} compact glyph`);
+			assert.equal(firstGrapheme(expanded), testCase.glyph, `${testCase.name} expanded glyph`);
+			assert.match((expanded.split("\n")[0] ?? "").trimEnd(), new RegExp(`reviewer(?: \\| [^·]+)? · ${testCase.label}$`), `${testCase.name} expanded label`);
+		}
+	});
+
+	it("keeps terminal results terminal in inline summaries with stale progress", () => {
+		const progress = {
+			index: 0,
+			agent: "reviewer",
+			status: "running",
+			task: "review",
+			recentTools: [],
+			recentOutput: [],
+			toolCount: 1,
+			tokens: 42,
+			durationMs: 1_000,
+		};
+		const cases = [
+			{ name: "detached", state: "paused", flag: { detached: true } },
+			{ name: "stopped", state: "stopped", flag: { stopped: true } },
+			{ name: "interrupted", state: "paused", flag: { interrupted: true } },
+		] as const;
+
+		for (const testCase of cases) {
+			const summary = renderSubagentSummary!({
+				content: [{ type: "text", text: testCase.name }],
+				details: {
+					mode: "single",
+					asyncId: "async-review",
+					progress: [progress],
+					results: [{
+						agent: "reviewer",
+						task: "review",
+						exitCode: 0,
+						messages: [],
+						usage: emptyUsage,
+						progress,
+						...testCase.flag,
+					}],
+				},
+			}, {}, theme).render(120).join("\n");
+
+			assert.match(summary, new RegExp(`· ${testCase.state}$`), testCase.name);
+			assert.doesNotMatch(summary, /running/, testCase.name);
+		}
+	});
+
+	it("keeps aggregate inline summaries running when another child is terminal", () => {
+		const progress = (index: number, agent: string) => ({
+			index,
+			agent,
+			status: "running" as const,
+			task: "review",
+			recentTools: [],
+			recentOutput: [],
+			toolCount: 1,
+			tokens: 42,
+			durationMs: 1_000,
+		});
+		const stoppedProgress = progress(0, "stopped-reviewer");
+		const runningProgress = progress(1, "running-reviewer");
+		const summary = renderSubagentSummary!({
+			content: [{ type: "text", text: "mixed" }],
+			details: {
+				mode: "parallel",
+				asyncId: "async-review",
+				progress: [stoppedProgress, runningProgress],
+				results: [
+					{ agent: "stopped-reviewer", task: "review", exitCode: 1, messages: [], usage: emptyUsage, stopped: true, progress: stoppedProgress },
+					{ agent: "running-reviewer", task: "review", exitCode: 0, messages: [], usage: emptyUsage, progress: runningProgress },
+				],
+			},
+		}, {}, theme).render(120).join("\n");
+
+		assert.match(summary, /· running$/);
+	});
+
+	it("keeps all-terminal async aggregate inline summaries terminal", () => {
+		const progress = (index: number, agent: string) => ({
+			index,
+			agent,
+			status: "running" as const,
+			task: "review",
+			recentTools: [],
+			recentOutput: [],
+			toolCount: 1,
+			tokens: 42,
+			durationMs: 1_000,
+		});
+		const stoppedProgress = progress(0, "stopped-reviewer");
+		const pausedProgress = progress(1, "paused-reviewer");
+		const detachedProgress = progress(2, "detached-reviewer");
+		const summary = renderSubagentSummary!({
+			content: [{ type: "text", text: "all terminal" }],
+			details: {
+				mode: "parallel",
+				asyncId: "async-review",
+				progress: [stoppedProgress, pausedProgress, detachedProgress],
+				results: [
+					{ agent: "stopped-reviewer", task: "review", exitCode: 1, messages: [], usage: emptyUsage, stopped: true, progress: stoppedProgress },
+					{ agent: "paused-reviewer", task: "review", exitCode: 1, messages: [], usage: emptyUsage, interrupted: true, progress: pausedProgress },
+					{ agent: "detached-reviewer", task: "review", exitCode: 0, messages: [], usage: emptyUsage, detached: true, progress: detachedProgress },
+				],
+			},
+		}, {}, theme).render(120).join("\n");
+
+		assert.match(summary, /· stopped$/);
+		assert.doesNotMatch(summary, /running/);
+	});
+
+	it("keeps all-completed async aggregate inline summaries terminal", () => {
+		for (const mode of ["parallel", "chain"] as const) {
+			const progress = ["writer", "reviewer"].map((agent, index) => ({
+				index,
+				agent,
+				status: "completed" as const,
+				task: "review",
+				recentTools: [],
+				recentOutput: [],
+				toolCount: 1,
+				tokens: 42,
+				durationMs: 1_000,
+			}));
+			const summary = renderSubagentSummary!({
+				content: [{ type: "text", text: "done" }],
+				details: {
+					mode,
+					asyncId: `async-${mode}`,
+					progress,
+					results: progress.map((entry) => ({ agent: entry.agent, task: "review", exitCode: 0, messages: [], usage: emptyUsage, progress: entry })),
+				},
+			}, {}, theme).render(120).join("\n");
+
+			assert.match(summary, /· completed$/, mode);
+			assert.doesNotMatch(summary, /running/, mode);
+		}
+	});
+
+	it("keeps all-failed async aggregate inline summaries terminal", () => {
+		for (const mode of ["parallel", "chain"] as const) {
+			const progress = ["writer", "reviewer"].map((agent, index) => ({
+				index,
+				agent,
+				status: "failed" as const,
+				task: "review",
+				recentTools: [],
+				recentOutput: [],
+				toolCount: 1,
+				tokens: 42,
+				durationMs: 1_000,
+			}));
+			const summary = renderSubagentSummary!({
+				content: [{ type: "text", text: "failed" }],
+				details: {
+					mode,
+					asyncId: `async-${mode}`,
+					progress,
+					results: progress.map((entry) => ({ agent: entry.agent, task: "review", exitCode: 1, error: "boom", messages: [], usage: emptyUsage, progress: entry })),
+				},
+			}, {}, theme).render(120).join("\n");
+
+			assert.match(summary, /· failed$/, mode);
+			assert.doesNotMatch(summary, /running/, mode);
+		}
+	});
+
+	it("uses shared semantic status presentation for expanded multi-result rows", () => {
+		const results = [
+			{
+				agent: "detached-agent",
+				task: "one",
+				exitCode: 0,
+				detached: true,
+				finalOutput: "output",
+				messages: [],
+				usage: emptyUsage,
+				progress: { index: 0, agent: "detached-agent", status: "running" as const, task: "one", recentTools: [], recentOutput: [], toolCount: 1, tokens: 42, durationMs: 1000 },
+			},
+			{
+				agent: "stopped-agent",
+				task: "two",
+				exitCode: 1,
+				stopped: true,
+				finalOutput: "output",
+				messages: [],
+				usage: emptyUsage,
+				progress: { index: 1, agent: "stopped-agent", status: "running" as const, task: "two", recentTools: [], recentOutput: [], toolCount: 1, tokens: 42, durationMs: 1000 },
+			},
+			{
+				agent: "paused-agent",
+				task: "three",
+				exitCode: 1,
+				interrupted: true,
+				finalOutput: "Interrupted. Waiting for explicit next action.",
+				messages: [],
+				usage: emptyUsage,
+				progress: { index: 2, agent: "paused-agent", status: "running" as const, task: "three", recentTools: [], recentOutput: [], toolCount: 1, tokens: 42, durationMs: 1000 },
+			},
+			{ agent: "failed-agent", task: "four", exitCode: 1, error: "boom", finalOutput: "output", messages: [], usage: emptyUsage },
+			{ agent: "completed-agent", task: "five", exitCode: 0, finalOutput: "output", messages: [], usage: emptyUsage },
+		];
+		const result = {
+			content: [{ type: "text" as const, text: "mixed" }],
+			details: { mode: "parallel" as const, totalSteps: results.length, results },
+		};
+		const compact = renderSubagentResult!(result, { expanded: false }, theme).render(160).join("\n");
+		const expanded = renderSubagentResult!(result, { expanded: true }, theme).render(160).join("\n");
+
+		assert.match(compact, /^■ parallel/);
+		assert.match(compact, /■ Agent 3\/5: paused-agent/);
+		assert.doesNotMatch(compact, /running agent/);
+		assert.match(expanded, /^■ parallel[^\n]* · detached/);
+		assert.match(expanded, /■ Agent 1\/5: detached-agent[^\n]* · detached/);
+		assert.match(expanded, /■ Agent 2\/5: stopped-agent[^\n]* · stopped/);
+		assert.match(expanded, /■ Agent 3\/5: paused-agent[^\n]* · paused/);
+		assert.doesNotMatch(expanded, /running agent/);
+		assert.match(expanded, /✗ Agent 4\/5: failed-agent · failed/);
+		assert.match(expanded, /✓ Agent 5\/5: completed-agent · completed/);
+	});
+
+	it("renders a stale-running interrupted aggregate as paused", () => {
+		const result = {
+			content: [{ type: "text" as const, text: "paused" }],
+			details: {
+				mode: "parallel" as const,
+				totalSteps: 1,
+				results: [{
+					agent: "paused-agent",
+					task: "pause",
+					exitCode: 1,
+					interrupted: true,
+					finalOutput: "Interrupted. Waiting for explicit next action.",
+					messages: [],
+					usage: emptyUsage,
+					progress: { index: 0, agent: "paused-agent", status: "running" as const, task: "pause", recentTools: [], recentOutput: [], toolCount: 1, tokens: 42, durationMs: 1000 },
+				}],
+			},
+		};
+
+		const compact = renderSubagentResult!(result, { expanded: false }, theme).render(160).join("\n");
+		const expanded = renderSubagentResult!(result, { expanded: true }, theme).render(160).join("\n");
+
+		assert.match(compact, /^■ parallel/);
+		assert.match(expanded, /^■ parallel[^\n]* · paused/);
+	});
+
 	it("uses glyph-first compact rendering for completed subagents", () => {
 		const widget = renderSubagentResult!({
 			content: [{ type: "text", text: "done" }],
@@ -495,6 +814,23 @@ describe("renderSubagentResult fork indicator", () => {
 		}, { expanded: false }, theme).render(160).join("\n");
 		assert.match(multi, /Agent 1\/2: scout \(claude-haiku-4-5 · thinking low\)/);
 		assert.match(multi, /Agent 2\/2: worker \(gpt-5-mini\)/);
+
+		const expanded = renderSubagentResult!({
+			content: [{ type: "text", text: "done" }],
+			details: {
+				mode: "parallel",
+				totalSteps: 1,
+				results: [{
+					agent: "reviewer",
+					task: "review",
+					exitCode: 0,
+					messages: [],
+					usage: emptyUsage,
+					progressSummary: { toolCount: 1, tokens: 42, durationMs: 3_000, model: "openai-codex/gpt-5.5", thinking: "high" },
+				}],
+			},
+		}, { expanded: true }, theme).render(160).join("\n");
+		assert.match(expanded, /reviewer \(gpt-5\.5 · thinking high\)/);
 	});
 
 	it("keeps running compact result output stable when progress is unchanged", async () => {

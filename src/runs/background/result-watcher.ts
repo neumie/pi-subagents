@@ -20,6 +20,8 @@ import {
 } from "../../intercom/result-intercom.ts";
 import { projectNestedRegistryForRoot, sanitizeSummary } from "../shared/nested-events.ts";
 import { resolveWatchPath } from "../../shared/utils.ts";
+import { recordWaitCompletion } from "./wait-completions.ts";
+import { syncMissionFromAsyncCompletion } from "../../missions/lifecycle.ts";
 import type { CompletionNotifier, CompletionNotification } from "./notify.ts";
 
 const WATCHER_RESTART_DELAY_MS = 3000;
@@ -39,6 +41,8 @@ type ResultWatcherDeps = {
 	fs?: ResultWatcherFs;
 	timers?: ResultWatcherTimers;
 	notifier?: Pick<CompletionNotifier, "deliver">;
+	/** Receives persisted completions before active-session delivery filtering. */
+	observeCompletion?: (result: CompletionNotification & { runId: string }) => void;
 	/** External grouped-result transport. Disable when native completion notifications own delivery. */
 	deliverIntercomResults?: boolean;
 };
@@ -145,10 +149,25 @@ export function createResultWatcher(
 		try {
 			const data = JSON.parse(fsApi.readFileSync(resultPath, "utf-8")) as ResultFileData;
 			if (typeof data.sessionId !== "string" || !data.sessionId) return;
+			const runId = data.runId ?? data.id ?? file.replace(/\.json$/i, "");
+			try {
+				syncMissionFromAsyncCompletion({ ...data, runId });
+			} catch (error) {
+				console.error(`Mission completion sync failed for '${resultPath}':`, error);
+			}
+			try {
+				deps.observeCompletion?.({ ...data, runId });
+			} catch (error) {
+				console.error(`Completion observer failed for '${resultPath}':`, error);
+			}
 			const epoch = deliveryEpoch;
 			if (!ownsSession(data.sessionId, epoch)) return;
-
-			const runId = data.runId ?? data.id ?? file.replace(/\.json$/i, "");
+			// Recorded before dedupe and before the unlink below so subagent_wait can
+			// use the in-memory record or its bounded durable replay after cleanup.
+			recordWaitCompletion(state, runId, data, Date.now(), completionTtlMs, {
+				resultsDir,
+				sessionId: data.sessionId,
+			});
 			const hasExplicitNestedChildren = data.nestedChildren !== undefined;
 			let nestedChildren = compactNestedResultChildren(sanitizeNestedResultChildren(data.nestedChildren, resultPath, "nestedChildren"));
 			if (!nestedChildren?.length && !hasExplicitNestedChildren) {

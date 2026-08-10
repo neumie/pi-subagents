@@ -9,9 +9,8 @@
  * This module adds a portable, file-based control inbox inside the run directory.
  * The parent drops an interrupt request file; the runner watches the inbox and
  * routes the request into its existing graceful `interruptRunner()` (pause +
- * resumable), identically on every platform. The OS signal is kept only as an
- * opportunistic fast-path; its failure is non-fatal because the file inbox is
- * authoritative.
+ * resumable), identically on every platform. The file inbox is authoritative and
+ * avoids signaling a PID that the extension cannot prove belongs to the runner.
  */
 
 import { randomUUID } from "node:crypto";
@@ -20,13 +19,6 @@ import * as path from "node:path";
 import { writeAtomicJson } from "../../shared/atomic-json.ts";
 import { POLL_INTERVAL_MS } from "../../shared/types.ts";
 import { resolveWatchPath } from "../../shared/utils.ts";
-
-/**
- * Opportunistic fast-path interrupt signal. On Unix `SIGUSR2` is trapped by the
- * runner; on Windows `process.kill(pid, "SIGBREAK")` is not deliverable
- * cross-process and throws `ENOSYS`, so the file inbox below is the real channel.
- */
-export const INTERRUPT_SIGNAL: NodeJS.Signals = process.platform === "win32" ? "SIGBREAK" : "SIGUSR2";
 
 export type ControlChannelFs = Pick<typeof fs, "mkdirSync" | "existsSync" | "rmSync" | "watch" | "readdirSync" | "readFileSync" | "realpathSync">;
 export type ControlChannelTimers = { setInterval: typeof setInterval; clearInterval: typeof clearInterval };
@@ -60,11 +52,15 @@ export interface CheckpointDecisionRequest {
 	reason?: string;
 }
 
+export type SteerDeliveryMode = "steer" | "follow_up" | "auto";
+export type SteerDeliveryStatus = "delivered" | "queued";
+
 export interface SteerRequest {
 	type: "steer";
 	id: string;
 	ts: number;
 	message: string;
+	mode?: SteerDeliveryMode;
 	targetIndex?: number;
 	targetIndexes?: number[];
 	source?: string;
@@ -85,11 +81,14 @@ export interface SteerAck {
 	requestId: string;
 	index: number;
 	ts: number;
-	state: "delivered" | "failed";
+	state: "delivered" | "queued" | "failed";
+	deliveryStatus?: SteerDeliveryStatus;
 	message: string;
 }
 
 const STEER_REQUESTS_DIR = "steer-requests";
+const REVIVAL_BRIEFS_DIR = "revival-briefs";
+export const MAX_STEER_QUEUE_SIZE = 20;
 const STEER_TARGETS_DIR = "steer-targets";
 const STEER_CAPABILITIES_DIR = "steer-capabilities";
 const STEER_ACKS_DIR = "steer-acks";
@@ -186,6 +185,7 @@ function validSteerRequest(request: Partial<SteerRequest>): request is SteerRequ
 		&& typeof request.message === "string"
 		&& Boolean(request.message.trim())
 		&& Buffer.byteLength(request.message, "utf8") <= MAX_STEER_MESSAGE_BYTES
+		&& (request.mode === undefined || request.mode === "steer" || request.mode === "follow_up" || request.mode === "auto")
 		&& (request.targetIndex === undefined || (Number.isInteger(request.targetIndex) && request.targetIndex >= 0 && request.targetIndex <= 1_000_000))
 		&& (request.targetIndexes === undefined || (
 			request.targetIndex === undefined
@@ -218,14 +218,26 @@ export function writeSteerCapability(asyncDir: string, capability: Omit<SteerCap
 	return writeSteerCapabilityAt(steerCapabilityPath(asyncDir, capability.index), capability);
 }
 
+function steerAckWritePath(filePath: string, ack: Omit<SteerAck, "type" | "protocolVersion">): string {
+	const parsed = path.parse(filePath);
+	const stateOrder = ack.state === "queued" ? "0" : ack.state === "delivered" ? "1" : "2";
+	const timestamp = String(Math.trunc(ack.ts)).padStart(13, "0");
+	for (let suffix = 0; suffix < 1_000; suffix += 1) {
+		const candidate = path.join(parsed.dir, `${parsed.name}-${timestamp}-${stateOrder}-${ack.state}${suffix === 0 ? "" : `-${suffix}`}${parsed.ext}`);
+		if (!fs.existsSync(candidate)) return candidate;
+	}
+	throw new Error("steer acknowledgment queue is full.");
+}
+
 export function writeSteerAckAt(filePath: string, ack: Omit<SteerAck, "type" | "protocolVersion">): string {
 	assertChildIndex(ack.index);
 	if (!/^[^\s]+$/.test(ack.requestId) || ack.requestId.length > 256) throw new Error("steer acknowledgment requestId is invalid.");
 	if (!Number.isFinite(ack.ts) || ack.ts <= 0) throw new Error("steer acknowledgment ts must be a finite timestamp.");
 	if (!ack.message.trim() || ack.message.length > 1000) throw new Error("steer acknowledgment message is invalid.");
 	const record: SteerAck = { type: "steer-ack", protocolVersion: 1, ...ack, message: ack.message.trim() };
-	writeAtomicJson(filePath, record);
-	return filePath;
+	const ackPath = steerAckWritePath(filePath, ack);
+	writeAtomicJson(ackPath, record);
+	return ackPath;
 }
 
 export function writeSteerAck(asyncDir: string, ack: Omit<SteerAck, "type" | "protocolVersion">): string {
@@ -283,7 +295,7 @@ export function requestAsyncCheckpointDecision(
 
 export function requestAsyncSteer(
 	asyncDir: string,
-	payload: { message: string; targetIndex?: number; targetIndexes?: number[]; source?: string; id?: string; ts?: number },
+	payload: { message: string; mode?: SteerDeliveryMode; targetIndex?: number; targetIndexes?: number[]; source?: string; id?: string; ts?: number },
 	deps: { now?: () => number; randomId?: () => string } = {},
 ): string {
 	const message = payload.message.trim();
@@ -309,6 +321,7 @@ export function requestAsyncSteer(
 		id: payload.id ?? deps.randomId?.() ?? randomUUID(),
 		ts: payload.ts ?? deps.now?.() ?? Date.now(),
 		message,
+		...(payload.mode && payload.mode !== "steer" ? { mode: payload.mode } : {}),
 		...(payload.targetIndex !== undefined ? { targetIndex: payload.targetIndex } : {}),
 		...(payload.targetIndexes !== undefined ? { targetIndexes: [...payload.targetIndexes] } : {}),
 		...(payload.source ? { source: payload.source } : {}),
@@ -343,9 +356,10 @@ function parseSteerAck(raw: unknown): SteerAck | undefined {
 	if (input.type !== "steer-ack" || input.protocolVersion !== 1 || typeof input.requestId !== "string" || !/^[^\s]+$/.test(input.requestId) || input.requestId.length > 256) return undefined;
 	const { index, ts, state, message } = input;
 	if (typeof index !== "number" || typeof ts !== "number" || !Number.isInteger(index) || index < 0 || index > 1_000_000 || !Number.isFinite(ts) || ts <= 0) return undefined;
-	if (state !== "delivered" && state !== "failed") return undefined;
+	if (state !== "delivered" && state !== "queued" && state !== "failed") return undefined;
+	if (input.deliveryStatus !== undefined && input.deliveryStatus !== "delivered" && input.deliveryStatus !== "queued") return undefined;
 	if (typeof message !== "string" || !message.trim() || message.length > 1000) return undefined;
-	return { type: "steer-ack", protocolVersion: 1, requestId: input.requestId, index, ts, state, message: message.trim() };
+	return { type: "steer-ack", protocolVersion: 1, requestId: input.requestId, index, ts, state, ...(input.deliveryStatus ? { deliveryStatus: input.deliveryStatus } : {}), message: message.trim() };
 }
 
 export function readSteerCapability(asyncDir: string, index: number): SteerCapability | undefined {
@@ -401,6 +415,7 @@ function parseSteerRequest(raw: unknown): SteerRequest | undefined {
 		id: input.id.trim(),
 		ts: input.ts,
 		message: input.message.trim(),
+		...(input.mode ? { mode: input.mode } : {}),
 		...(input.targetIndex !== undefined ? { targetIndex: input.targetIndex } : {}),
 		...(input.targetIndexes !== undefined ? { targetIndexes: [...input.targetIndexes] } : {}),
 		...(typeof input.source === "string" && input.source.trim() ? { source: input.source } : {}),
@@ -438,6 +453,27 @@ export function consumeSteerRequestsFromDir(dir: string, fsImpl: Pick<typeof fs,
 
 export function consumeSteerRequests(asyncDir: string, fsImpl: Pick<typeof fs, "existsSync" | "rmSync" | "readdirSync" | "readFileSync"> = fs): SteerRequest[] {
 	return consumeSteerRequestsFromDir(steerRequestsDir(asyncDir), fsImpl);
+}
+
+export function queueRevivalBrief(asyncDir: string, request: SteerRequest): string {
+	const dir = path.join(controlInboxDir(asyncDir), REVIVAL_BRIEFS_DIR);
+	const queued = fs.existsSync(dir) ? fs.readdirSync(dir).filter((entry) => entry.endsWith(".json")).length : 0;
+	if (queued >= MAX_STEER_QUEUE_SIZE) throw new Error(`Follow-up queue is full (${MAX_STEER_QUEUE_SIZE} messages).`);
+	return writeSteerRequestToDir(dir, { ...request, mode: "follow_up" });
+}
+
+export function readRevivalBriefs(asyncDir: string): Array<{ request: SteerRequest; path: string }> {
+	const dir = path.join(controlInboxDir(asyncDir), REVIVAL_BRIEFS_DIR);
+	if (!fs.existsSync(dir)) return [];
+	return fs.readdirSync(dir).filter((entry) => entry.endsWith(".json")).sort().flatMap((entry) => {
+		const filePath = path.join(dir, entry);
+		try {
+			const request = parseSteerRequest(JSON.parse(fs.readFileSync(filePath, "utf-8")));
+			return request ? [{ request, path: filePath }] : [];
+		} catch {
+			return [];
+		}
+	});
 }
 
 /**
@@ -501,38 +537,13 @@ export function consumeCheckpointDecisionRequest(
 	return undefined;
 }
 
-/**
- * Parent side: portable interrupt = authoritative file request + best-effort OS
- * signal. The signal is only a latency optimization on Unix; ENOSYS on Windows
- * is swallowed because the file inbox is authoritative there. Other signal
- * failures are surfaced because they usually mean the runner is not alive to
- * consume the request.
- */
+/** Parent side: write the authoritative portable interrupt request. */
 export function deliverInterruptRequest(input: {
 	asyncDir: string;
-	pid?: number;
-	kill?: KillFn;
-	signal?: NodeJS.Signals;
 	now?: () => number;
 	source?: string;
 }): void {
-	const requestPath = requestAsyncInterrupt(input.asyncDir, input.source ? { source: input.source } : {}, { now: input.now });
-	if (typeof input.pid === "number" && input.pid > 0) {
-		try {
-			(input.kill ?? process.kill)(input.pid, input.signal ?? INTERRUPT_SIGNAL);
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException | undefined)?.code === "ENOSYS") {
-				// File inbox is authoritative when custom cross-process signals are unavailable.
-				return;
-			}
-			try {
-				fs.rmSync(requestPath, { force: true });
-			} catch {
-				// Best effort cleanup; the caller still gets the signal failure.
-			}
-			throw error;
-		}
-	}
+	requestAsyncInterrupt(input.asyncDir, input.source ? { source: input.source } : {}, { now: input.now });
 }
 
 export function deliverTimeoutRequest(input: {

@@ -71,7 +71,7 @@ describe("subagent extension child mode", () => {
 		);
 	});
 
-	it("renders only the public single and workflow execution modes", () => {
+	it("renders only the public workflow execution mode", () => {
 		const script = String.raw`
 			import registerSubagentExtension from "./index.ts";
 			const events = { on() { return () => {}; }, emit() {} };
@@ -84,12 +84,132 @@ describe("subagent extension child mode", () => {
 			registerSubagentExtension(fakePi);
 			if (!registeredTool) throw new Error("tool not registered");
 			const theme = { fg(_name, text) { return text; }, bold(text) { return text; } };
-			const single = registeredTool.renderCall({ agent: "worker", async: true }, theme).text;
-			const workflow = registeredTool.renderCall({ workflowScript: "return null" }, theme).text;
-			if (!single.includes("worker [async]")) throw new Error("expected async single badge, got " + single);
-			if (!workflow.includes("workflow script")) throw new Error("expected workflow label, got " + workflow);
+			const workflow = registeredTool.renderCall({
+				workflowScript: "const scan = await runs.run('scan', {agent:'worker'}); return runs.all([{key:'correctness',agent:'reviewer'},{key:'tests',agent:'reviewer'}]);",
+			}, theme).text;
+			const foregroundWorkflow = registeredTool.renderCall({ workflowScript: "return runs.run('publish', {agent:'worker'});", async: false }, theme).text;
+			const templateWorkflow = registeredTool.renderCall({ workflowScript: "return runs.run(\`template\`, {agent:'worker'});", async: false }, theme).text;
+			const commentedWorkflow = registeredTool.renderCall({ workflowScript: "// runs.run('ignored', {agent:'worker'})\nconst note = \"key: 'also-ignored'\"; return runs.run('real', {agent:'worker'});" }, theme).text;
+			const dynamicKeyWorkflow = registeredTool.renderCall({ workflowScript: "return runs.all([{key: 'review-' + item, agent: 'reviewer'}]);" }, theme).text;
+			const ordinaryKeyWorkflow = registeredTool.renderCall({ workflowScript: "const config = {key: 'secret'}; return runs.all([{agent: 'reviewer', config: {key: 'nested'}, key: 'review'}]);" }, theme).text;
+			if (!workflow.includes("background · 3 lanes: scan, correctness, tests")) throw new Error("expected workflow manifest, got " + workflow);
+			if (!foregroundWorkflow.includes("foreground · 1 lane: publish")) throw new Error("expected foreground workflow manifest, got " + foregroundWorkflow);
+			if (!templateWorkflow.includes("foreground · 1 lane: template")) throw new Error("expected static template lane, got " + templateWorkflow);
+			if (!commentedWorkflow.includes("background · 1 lane: real")) throw new Error("expected lexical lane filtering, got " + commentedWorkflow);
+			if (!dynamicKeyWorkflow.includes("workflow script · background")) throw new Error("expected dynamic key fallback, got " + dynamicKeyWorkflow);
+			if (!ordinaryKeyWorkflow.includes("background · 1 lane: review") || ordinaryKeyWorkflow.includes("secret") || ordinaryKeyWorkflow.includes("nested")) throw new Error("expected only runs.all child key, got " + ordinaryKeyWorkflow);
 		`;
 		execFileSync(process.execPath, ["--experimental-strip-types", "--import", "./test/support/register-loader.mjs", "--input-type=module", "--eval", script], { cwd: projectRoot, env: parentToolEnv(), stdio: "pipe" });
+	});
+
+	it("shows omitted workflow async as background even when asyncByDefault is false", () => {
+		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-workflow-manifest-config-"));
+		try {
+			const configDir = path.join(agentDir, "extensions", "subagent");
+			fs.mkdirSync(configDir, { recursive: true });
+			fs.writeFileSync(path.join(configDir, "config.json"), JSON.stringify({ asyncByDefault: false, forceTopLevelAsync: true }), "utf-8");
+			const script = String.raw`
+				import registerSubagentExtension from "./index.ts";
+				const events = { on() { return () => {}; }, emit() {} };
+				let registeredTool;
+				const fakePi = new Proxy({
+					events, registerTool(tool) { if (tool.name === "subagent") registeredTool = tool; },
+					registerCommand() {}, registerShortcut() {}, registerMessageRenderer() {}, sendMessage() {}, getSessionName() {},
+				}, { get(target, prop) { return prop in target ? target[prop] : () => undefined; } });
+				registerSubagentExtension(fakePi);
+				const theme = { fg(_name, text) { return text; }, bold(text) { return text; } };
+				const result = registeredTool.renderCall({
+					workflowScript: "return runs.run('scan' /* stable lane */, {agent:'worker'});",
+				}, theme).text;
+				const explicitForeground = registeredTool.renderCall({
+					workflowScript: "return runs.run('publish', {agent:'worker'});",
+					async: false,
+				}, theme).text;
+				if (!result.includes("background · 1 lane: scan")) throw new Error("expected workflow executor background manifest, got " + result);
+				if (!explicitForeground.includes("foreground · 1 lane: publish")) throw new Error("expected workflow executor foreground manifest, got " + explicitForeground);
+			`;
+			const env = parentToolEnv();
+			env.PI_CODING_AGENT_DIR = agentDir;
+			execFileSync(process.execPath, ["--experimental-strip-types", "--import", "./test/support/register-loader.mjs", "--input-type=module", "--eval", script], { cwd: projectRoot, env, stdio: "pipe" });
+		} finally {
+			fs.rmSync(agentDir, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps registered tool errors actionable while successful results stay collapsed", () => {
+		const script = String.raw`
+			import registerSubagentExtension from "./index.ts";
+			const events = { on() { return () => {}; }, emit() {} };
+			let registeredTool;
+			const fakePi = new Proxy({
+				events,
+				registerTool(tool) { if (tool.name === "subagent") registeredTool = tool; },
+				registerCommand() {}, registerShortcut() {}, registerMessageRenderer() {},
+				sendMessage() {}, getSessionName() { return undefined; },
+			}, { get(target, prop) { return prop in target ? target[prop] : () => undefined; } });
+			registerSubagentExtension(fakePi);
+			if (!registeredTool) throw new Error("tool not registered");
+
+			const theme = { fg(_name, text) { return text; }, bold(text) { return text; } };
+			const render = (text, isError) => registeredTool.renderResult({
+				content: [{ type: "text", text }],
+				details: { mode: "management", results: [] },
+			}, { expanded: false }, theme, { isError, state: {} }).render(120).join("\n");
+
+			const error = render("Agent configuration is invalid.\nSet tools to an array.\nRetry the subagent call.", true);
+			if (!error.includes("Set tools to an array.")) throw new Error("error remediation was hidden: " + error);
+			if (!error.includes("Retry the subagent call.")) throw new Error("error retry guidance was hidden: " + error);
+			if (error.includes("3 lines")) throw new Error("error was collapsed: " + error);
+
+			const success = render("Managed agents:\n- reviewer\n- writer", false);
+			if (!success.includes("Managed agents: · 3 lines")) throw new Error("success summary was not collapsed: " + success);
+			if (success.includes("- reviewer") || success.includes("- writer")) throw new Error("success details were not collapsed: " + success);
+		`;
+
+		execFileSync(
+			process.execPath,
+			[
+				"--experimental-strip-types",
+				"--import",
+				"./test/support/register-loader.mjs",
+				"--input-type=module",
+				"--eval",
+				script,
+			],
+			{ cwd: projectRoot, env: parentToolEnv(), stdio: "pipe" },
+		);
+	});
+
+	it("rejects blank action at the public executor boundary", () => {
+		const script = String.raw`
+			import registerSubagentExtension from "./index.ts";
+			const events = { on() { return () => {}; }, emit() {} };
+			let registeredTool;
+			const fakePi = new Proxy({
+				events,
+				registerTool(tool) { if (tool.name === "subagent") registeredTool = tool; },
+				registerCommand() {}, registerShortcut() {}, registerMessageRenderer() {}, sendMessage() {}, getSessionName() {},
+			}, { get(target, prop) { return prop in target ? target[prop] : () => undefined; } });
+			registerSubagentExtension(fakePi);
+			if (!registeredTool) throw new Error("tool not registered");
+			const result = await registeredTool.execute("blank-action", { action: "", agent: "reviewer" }, new AbortController().signal, undefined, { cwd: process.cwd(), hasUI: false });
+			if (!result.isError) throw new Error("blank action should be rejected");
+			const text = result.content?.[0]?.text ?? "";
+			if (!text.includes("action must be a non-empty")) throw new Error("unexpected blank action error: " + text);
+		`;
+
+		execFileSync(
+			process.execPath,
+			[
+				"--experimental-strip-types",
+				"--import",
+				"./test/support/register-loader.mjs",
+				"--input-type=module",
+				"--eval",
+				script,
+			],
+			{ cwd: projectRoot, env: parentToolEnv(), stdio: "pipe" },
+		);
 	});
 
 	it("does not animate foreground results on a timer", () => {
@@ -141,6 +261,88 @@ describe("subagent extension child mode", () => {
 			],
 			{ cwd: projectRoot, env: parentToolEnv(), stdio: "pipe" },
 		);
+	});
+
+	it("keeps summary inline tool display to one stable row for every supported state", () => {
+		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-inline-display-config-"));
+		try {
+			const configDir = path.join(agentDir, "extensions", "subagent");
+			fs.mkdirSync(configDir, { recursive: true });
+			fs.writeFileSync(path.join(configDir, "config.json"), JSON.stringify({ inlineToolDisplay: "summary" }), "utf-8");
+
+			const script = String.raw`
+				import registerSubagentExtension from "./index.ts";
+				const events = { on() { return () => {}; }, emit() {} };
+				let registeredTool;
+				const fakePi = new Proxy({
+					events,
+					registerTool(tool) { if (tool.name === "subagent") registeredTool = tool; },
+					registerCommand() {}, registerShortcut() {}, registerMessageRenderer() {}, sendMessage() {}, getSessionName() {},
+				}, { get(target, prop) { return prop in target ? target[prop] : () => undefined; } });
+				registerSubagentExtension(fakePi);
+				if (!registeredTool) throw new Error("tool not registered");
+				const theme = { fg(_name, text) { return text; }, bold(text) { return text; } };
+				const base = {
+					agent: "delegate", task: "quiet", messages: [],
+					usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
+				};
+				const running = registeredTool.renderResult({
+					content: [{ type: "text", text: "partial output that must not appear" }],
+					details: { mode: "single", results: [{ ...base, exitCode: 0, progress: { status: "running", index: 0, agent: "delegate", toolCount: 2, tokens: 300, durationMs: 20_000 } }] },
+				}, { expanded: false, isPartial: true }, theme, { state: {} }).render(120);
+				const asyncSingle = registeredTool.renderResult({
+					content: [{ type: "text", text: "Async: delegate [single-run]" }],
+					details: { mode: "single", runId: "single-run", asyncId: "single-run", asyncDir: "/tmp/single-run", results: [] },
+				}, { expanded: false }, theme, { state: {} }).render(120);
+				const asyncChain = registeredTool.renderResult({
+					content: [{ type: "text", text: "Async chain [chain-run]" }],
+					details: { mode: "chain", runId: "chain-run", asyncId: "chain-run", asyncDir: "/tmp/chain-run", results: [] },
+				}, { expanded: false }, theme, { state: {} }).render(120);
+				const completed = registeredTool.renderResult({
+					content: [{ type: "text", text: "completed output that must not appear" }],
+					details: { mode: "single", results: [{ ...base, exitCode: 0 }] },
+				}, { expanded: true, isPartial: false }, theme, { state: {} }).render(120);
+				const stopped = registeredTool.renderResult({
+					content: [{ type: "text", text: "cancelled output that must not appear" }],
+					details: { mode: "single", results: [{ ...base, exitCode: 1, stopped: true, error: "Cancelled by user" }] },
+				}, { expanded: true, isPartial: false }, theme, { state: {} }).render(120);
+				const paused = registeredTool.renderResult({
+					content: [{ type: "text", text: "paused output that must not appear" }],
+					details: { mode: "single", results: [{ ...base, exitCode: 1, interrupted: true }] },
+				}, { expanded: true, isPartial: false }, theme, { state: {} }).render(120);
+				const failed = registeredTool.renderResult({
+					content: [{ type: "text", text: "failed output that must not appear" }],
+					details: { mode: "single", results: [{ ...base, exitCode: 1, stopped: false }] },
+				}, { expanded: true, isPartial: false }, theme, { state: {} }).render(120);
+				const failedWithPaused = registeredTool.renderResult({
+					content: [{ type: "text", text: "aggregate output that must not appear" }],
+					details: { mode: "parallel", results: [{ ...base, agent: "paused", exitCode: 1, interrupted: true }, { ...base, agent: "failed", exitCode: 1, stopped: false }] },
+				}, { expanded: true, isPartial: false }, theme, { state: {} }).render(120);
+				const failedWithStopped = registeredTool.renderResult({
+					content: [{ type: "text", text: "aggregate output that must not appear" }],
+					details: { mode: "parallel", results: [{ ...base, agent: "stopped", exitCode: 1, stopped: true }, { ...base, agent: "failed", exitCode: 1, stopped: false }] },
+				}, { expanded: true, isPartial: false }, theme, { state: {} }).render(120);
+				const contextError = registeredTool.renderResult({
+					content: [{ type: "text", text: "Agent configuration is invalid." }],
+					details: { mode: "management", results: [] },
+				}, { expanded: false, isPartial: false }, theme, { isError: true, state: {} }).render(120);
+				if (running.length !== 1 || running[0] !== "● delegate · running") throw new Error("unexpected running summary: " + JSON.stringify(running));
+				if (asyncSingle.length !== 1 || asyncSingle[0] !== "● single · running") throw new Error("unexpected async single summary: " + JSON.stringify(asyncSingle));
+				if (asyncChain.length !== 1 || asyncChain[0] !== "● chain · running") throw new Error("unexpected async chain summary: " + JSON.stringify(asyncChain));
+				if (completed.length !== 1 || completed[0] !== "✓ delegate · completed") throw new Error("unexpected completed summary: " + JSON.stringify(completed));
+				if (stopped.length !== 1 || stopped[0] !== "■ delegate · stopped") throw new Error("unexpected stopped summary: " + JSON.stringify(stopped));
+				if (paused.length !== 1 || paused[0] !== "■ delegate · paused") throw new Error("unexpected paused summary: " + JSON.stringify(paused));
+				if (failed.length !== 1 || failed[0] !== "✗ delegate · failed") throw new Error("unexpected failed summary: " + JSON.stringify(failed));
+				if (failedWithPaused.length !== 1 || failedWithPaused[0] !== "✗ parallel · failed") throw new Error("unexpected paused aggregate summary: " + JSON.stringify(failedWithPaused));
+				if (failedWithStopped.length !== 1 || failedWithStopped[0] !== "✗ parallel · failed") throw new Error("unexpected stopped aggregate summary: " + JSON.stringify(failedWithStopped));
+				if (contextError.length !== 1 || contextError[0] !== "✗ management · failed") throw new Error("unexpected context error summary: " + JSON.stringify(contextError));
+			`;
+			const env = parentToolEnv();
+			env.PI_CODING_AGENT_DIR = agentDir;
+			execFileSync(process.execPath, ["--experimental-strip-types", "--import", "./test/support/register-loader.mjs", "--input-type=module", "--eval", script], { cwd: projectRoot, env, stdio: "pipe" });
+		} finally {
+			fs.rmSync(agentDir, { recursive: true, force: true });
+		}
 	});
 
 	it("registers only subagent_wait and honors waitTool disabled config", () => {
@@ -672,6 +874,10 @@ describe("subagent extension child mode", () => {
 			if (!create.isError) throw new Error("create should be blocked");
 			const text = create.content?.[0]?.text ?? "";
 			if (!text.includes("not available from child-safe subagent fanout mode")) throw new Error("unexpected create error: " + text);
+			const refine = await registeredTool.execute("refine-check", { action: "refine", agent: "worker" }, new AbortController().signal, undefined, ctx);
+			if (!refine.isError) throw new Error("refine should be blocked");
+			const refineText = refine.content?.[0]?.text ?? "";
+			if (!refineText.includes("not available from child-safe subagent fanout mode")) throw new Error("unexpected refine error: " + refineText);
 			const grant = await registeredTool.execute("grant-check", { action: "grant-spawn-budget", additional: 1 }, new AbortController().signal, undefined, { ...ctx, hasUI: true });
 			if (!grant.isError) throw new Error("grant-spawn-budget should be blocked");
 			const grantText = grant.content?.[0]?.text ?? "";

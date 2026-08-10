@@ -94,7 +94,7 @@ async function paneExists(client: HerdrClient, paneId: string, signal?: AbortSig
 function projectPaneCommand(message: string | undefined): string {
 	const args = message?.trim() ? [message.trim()] : [];
 	const command = getPiSpawnCommand(args);
-	return [command.command, ...command.args].map(shellQuote).join(" ");
+	return `${process.platform === "win32" ? "& " : ""}${[command.command, ...command.args].map(shellQuote).join(" ")}`;
 }
 
 export async function handleHerdrProjectPaneAction(action: HerdrProjectPaneAction, params: ProjectPaneParams, deps: ProjectPaneDeps): Promise<AgentToolResult<Details>> {
