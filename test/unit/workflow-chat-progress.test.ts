@@ -48,7 +48,6 @@ function createState(): SubagentState {
 		foregroundRuns: new Map(),
 		foregroundControls: new Map(),
 		lastForegroundControlId: null,
-		pendingForegroundControlNotices: new Map(),
 		cleanupTimers: new Map(),
 		lastUiContext: null,
 		poller: null,
@@ -59,10 +58,10 @@ function createState(): SubagentState {
 	};
 }
 
-function createExecutor() {
+function createExecutor(state = createState()) {
 	return createSubagentExecutor({
 		pi: { events: { emit() {}, on() { return () => {}; } }, getSessionName() { return "parent"; } } as any,
-		state: createState(),
+		state,
 		config: { maxSubagentDepth: 2, control: {}, intercomBridge: {} } as any,
 		asyncByDefault: false,
 		tempArtifactsDir: os.tmpdir(),
@@ -113,14 +112,22 @@ describe("workflow chat progress rendering", () => {
 		const repo = createRepo("pi-workflow-progress-executor-");
 		try {
 			const updates: Array<{ details?: Details }> = [];
-			const result = await createExecutor().execute(
+			const state = createState();
+			let observedWorkflowControl = false;
+			const result = await createExecutor(state).execute(
 				"wf-live",
 				{ workflowScript: `return await runs.run("scout", { agent: "missing-agent", task: "scan", phase: "Validation", label: "Find renderer seam" });`, async: false },
 				new AbortController().signal,
-				(update) => updates.push(update),
+				(update) => {
+					updates.push(update);
+					const control = state.foregroundControls?.get("wf-live");
+					observedWorkflowControl ||= control?.mode === "workflow" && control.workflow?.trace[0]?.key === "scout";
+				},
 				ctx(repo),
 			);
-			assert.equal(result.isError, true);
+			assert.equal((result as any).isError, true);
+			assert.equal(observedWorkflowControl, true);
+			assert.equal(state.foregroundControls?.has("wf-live"), false);
 			const liveUpdate = updates.find((update) => update.details?.chatProgress?.mode === "live-card");
 			assert.ok(liveUpdate, "expected a live-card update");
 			assert.equal(liveUpdate.details?.workflow?.trace[0]?.key, "scout");

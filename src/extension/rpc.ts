@@ -10,6 +10,7 @@ import { resolveCurrentSessionId } from "../shared/session-identity.ts";
 import {
 	type AsyncJobStep,
 	type Details,
+	type ForegroundRunControl,
 	type SubagentState,
 	DIRS,
 	SUBAGENT_ASYNC_COMPLETE_EVENT,
@@ -18,6 +19,7 @@ import {
 } from "../shared/types.ts";
 import { readStatus } from "../shared/utils.ts";
 import { SubagentParams } from "./schemas.ts";
+import { buildWorkflowChatProgressRows } from "../workflows/chat-progress.ts";
 import { formatWorkflowJsonPreview } from "../workflows/scripted-workflow.ts";
 import { normalizePublicSubagentExecution } from "./public-execution.ts";
 
@@ -72,6 +74,33 @@ interface EventBus {
 	emit(event: string, data: unknown): void;
 }
 
+export type SubagentRpcFleetWorkflowStepState = "pending" | "running" | "completed" | "failed";
+
+export interface SubagentRpcFleetWorkflowStep {
+	/** Display-safe workflowScript key supplied by the caller; never an internal run id. */
+	key: string;
+	agent: string;
+	label?: string;
+	phase?: string;
+	state: SubagentRpcFleetWorkflowStepState;
+	model?: string;
+	effort?: string;
+	startedAt?: number;
+	tokens: { input: number; output: number; total: number };
+	goal?: string;
+}
+
+export interface SubagentRpcFleetWorkflow {
+	phase?: string;
+	total: number;
+	completed: number;
+	running: number;
+	pending: number;
+	failed: number;
+	steps: SubagentRpcFleetWorkflowStep[];
+	omitted: number;
+}
+
 export interface SubagentRpcFleetEntry {
 	/** Opaque key for client-side reconciliation; never a run or async identifier. */
 	key: string;
@@ -83,18 +112,23 @@ export interface SubagentRpcFleetEntry {
 	startedAt: number;
 	tokens: { input: number; output: number; total: number };
 	goal?: string;
+	/** Additive workflow grouping metadata; absent for ordinary fleet entries. */
+	kind?: "workflow";
+	workflow?: SubagentRpcFleetWorkflow;
 }
 
 export interface SubagentRpcFleetStatus {
 	version: 1;
 	entries: SubagentRpcFleetEntry[];
-	/** Total active children before the bounded entries window. */
+	/** Total active top-level fleet groups before the bounded entries window. */
 	totalActive: number;
 	omitted: number;
 }
 
 const MAX_FLEET_ENTRIES = 16;
+const MAX_WORKFLOW_STEPS = 16;
 const MAX_FLEET_CANDIDATES = 256;
+const MAX_WORKFLOW_TRACE_EVENTS = MAX_FLEET_CANDIDATES * 4;
 const MAX_AGENT_LENGTH = 96;
 const MAX_GOAL_LENGTH = 512;
 const MAX_METADATA_LENGTH = 128;
@@ -127,6 +161,137 @@ function activeState(value: unknown): boolean {
 	return value === "running" || value === "queued" || value === "pending";
 }
 
+function workflowStepState(value: unknown): SubagentRpcFleetWorkflowStepState {
+	if (value === "complete" || value === "completed") return "completed";
+	if (value === "failed" || value === "rejected" || value === "stopped") return "failed";
+	if (value === "running") return "running";
+	return "pending";
+}
+
+function foregroundLeaf(control: ForegroundRunControl) {
+	return control.activeChildren?.size
+		? [...control.activeChildren.values()].sort((left, right) => left.index - right.index)[0]
+		: undefined;
+}
+
+type WorkflowProgressRow = ReturnType<typeof buildWorkflowChatProgressRows>[number];
+type OrderedWorkflowStep = SubagentRpcFleetWorkflowStep & { order: number };
+
+interface WorkflowFleetSources {
+	traceByKey: Map<string, WorkflowProgressRow>;
+	stepByKey: Map<string, AsyncJobStep>;
+	controlByKey: Map<string, ForegroundRunControl>;
+	keys: string[];
+	sourceOmitted: number;
+}
+
+function collectWorkflowFleetSources(
+	workflow: Details["workflow"] | undefined,
+	steps: AsyncJobStep[] | undefined,
+	controls: ForegroundRunControl[],
+): WorkflowFleetSources {
+	const sourceTrace = workflow?.trace ?? [];
+	const traceRows = buildWorkflowChatProgressRows(sourceTrace.slice(-MAX_WORKFLOW_TRACE_EVENTS));
+	const traceByKey = new Map(traceRows.map((row) => [row.key, row]));
+	const sourceSteps = steps ?? [];
+	const stepByKey = new Map<string, AsyncJobStep>();
+	for (const [offset, step] of sourceSteps.slice(0, MAX_FLEET_CANDIDATES).entries()) {
+		const baseKey = step.workflowKey ?? step.label ?? step.agent;
+		if (!baseKey) continue;
+		let key = baseKey;
+		let suffix = step.index ?? offset;
+		while (stepByKey.has(key)) key = `${baseKey}#${++suffix}`;
+		stepByKey.set(key, step);
+	}
+	const controlByKey = new Map<string, ForegroundRunControl>();
+	for (const control of controls.slice(0, MAX_FLEET_CANDIDATES)) {
+		if (control.workflowKey) controlByKey.set(control.workflowKey, control);
+	}
+	const keys: string[] = [];
+	const seen = new Set<string>();
+	let sourceOmitted = Math.max(0, sourceSteps.length - MAX_FLEET_CANDIDATES)
+		+ Math.max(0, controls.length - MAX_FLEET_CANDIDATES);
+	if (sourceTrace.length > MAX_WORKFLOW_TRACE_EVENTS && traceRows.length >= MAX_FLEET_CANDIDATES) {
+		sourceOmitted = Math.max(1, sourceOmitted);
+	}
+	const addKey = (key: string) => {
+		if (!key || seen.has(key)) return;
+		seen.add(key);
+		if (keys.length < MAX_FLEET_CANDIDATES) keys.push(key);
+		else sourceOmitted += 1;
+	};
+	for (const row of traceRows) addKey(row.key);
+	for (const key of stepByKey.keys()) addKey(key);
+	for (const key of controlByKey.keys()) addKey(key);
+	return { traceByKey, stepByKey, controlByKey, keys, sourceOmitted };
+}
+
+function projectWorkflowStep(key: string, order: number, sources: WorkflowFleetSources): OrderedWorkflowStep | undefined {
+	const trace = sources.traceByKey.get(key);
+	const step = sources.stepByKey.get(key);
+	const control = sources.controlByKey.get(key);
+	const leaf = control ? foregroundLeaf(control) : undefined;
+	const publicKey = displayText(key, MAX_AGENT_LENGTH);
+	const agent = displayText(leaf?.agent ?? control?.currentAgent ?? step?.agent ?? key, MAX_AGENT_LENGTH);
+	if (!publicKey || !agent) return undefined;
+	const label = displayText(trace?.label ?? (step?.label === key ? undefined : step?.label), MAX_METADATA_LENGTH);
+	const phase = displayText(trace?.phase ?? step?.phase, MAX_METADATA_LENGTH);
+	const model = displayText(leaf?.model ?? control?.model ?? step?.model, MAX_METADATA_LENGTH);
+	const effort = displayText(leaf?.thinking ?? control?.thinking ?? step?.thinking, MAX_METADATA_LENGTH);
+	const goal = displayText(leaf?.description ?? control?.description ?? step?.description, MAX_GOAL_LENGTH);
+	const startedAt = leaf?.startedAt ?? control?.startedAt ?? step?.startedAt;
+	let tokenSource: unknown = step?.tokens;
+	if (!tokenSource && leaf) tokenSource = { input: leaf.inputTokens, output: leaf.outputTokens, total: leaf.tokens };
+	if (!tokenSource && control) tokenSource = { input: control.inputTokens, output: control.outputTokens, total: control.tokens };
+	let sourceState: unknown = trace?.state === "running" ? "pending" : trace?.state;
+	if (control) sourceState = "running";
+	if (step?.status) sourceState = step.status;
+	return {
+		key: publicKey,
+		agent,
+		...(label ? { label } : {}),
+		...(phase ? { phase } : {}),
+		state: workflowStepState(sourceState),
+		...(model ? { model } : {}),
+		...(effort ? { effort } : {}),
+		...(typeof startedAt === "number" && Number.isSafeInteger(startedAt) && startedAt >= 0 ? { startedAt } : {}),
+		tokens: publicTokens(tokenSource),
+		...(goal ? { goal } : {}),
+		order,
+	};
+}
+
+function buildWorkflowFleet(
+	workflow: Details["workflow"] | undefined,
+	steps: AsyncJobStep[] | undefined,
+	controls: ForegroundRunControl[] = [],
+): SubagentRpcFleetWorkflow {
+	const sources = collectWorkflowFleetSources(workflow, steps, controls);
+	const rows = sources.keys.flatMap((key, order) => {
+		const row = projectWorkflowStep(key, order, sources);
+		return row ? [row] : [];
+	});
+	const count = (state: SubagentRpcFleetWorkflowStepState) => rows.filter((row) => row.state === state).length;
+	const priority: Record<SubagentRpcFleetWorkflowStepState, number> = { running: 0, pending: 1, failed: 2, completed: 3 };
+	const visible = [...rows]
+		.sort((left, right) => priority[left.state] - priority[right.state] || left.order - right.order)
+		.slice(0, MAX_WORKFLOW_STEPS)
+		.map(({ order: _order, ...row }) => row);
+	const phase = rows.find((row) => row.state === "running" && row.phase)?.phase
+		?? rows.toReversed().find((row) => row.phase)?.phase;
+	const total = Math.min(MAX_FLEET_CANDIDATES, rows.length + sources.sourceOmitted);
+	return {
+		...(phase ? { phase } : {}),
+		total,
+		completed: count("completed"),
+		running: count("running"),
+		pending: count("pending"),
+		failed: count("failed"),
+		steps: visible,
+		omitted: Math.max(0, total - visible.length),
+	};
+}
+
 interface FleetKeyState {
 	sessionId: string | null;
 	next: number;
@@ -142,6 +307,8 @@ interface FleetCandidate {
 	startedAt: unknown;
 	tokens?: unknown;
 	goal?: unknown;
+	kind?: "workflow";
+	workflow?: SubagentRpcFleetWorkflow;
 }
 
 function buildFleetStatus(
@@ -166,8 +333,39 @@ function buildFleetStatus(
 		totalActive += 1;
 		if (candidates.length < MAX_FLEET_CANDIDATES) candidates.push(candidate);
 	};
-	for (const control of state.foregroundControls.values()) {
-		if (control.sessionId !== authoritativeSessionId) continue;
+	const foregroundControls = [...state.foregroundControls.values()]
+		.filter((control) => control.sessionId === authoritativeSessionId);
+	const activeJobs = [...state.asyncJobs.values()]
+		.filter((job) => job.sessionId === authoritativeSessionId && activeState(job.status));
+	const workflowParents = new Set<string>();
+	for (const control of foregroundControls) {
+		if (control.mode === "workflow") workflowParents.add(control.runId);
+	}
+	for (const job of activeJobs) {
+		if (job.mode === "workflow") workflowParents.add(job.asyncId);
+	}
+	const workflowChildren = new Map<string, ForegroundRunControl[]>();
+	for (const control of foregroundControls) {
+		if (!control.parentWorkflowRunId || !workflowParents.has(control.parentWorkflowRunId)) continue;
+		const children = workflowChildren.get(control.parentWorkflowRunId) ?? [];
+		children.push(control);
+		workflowChildren.set(control.parentWorkflowRunId, children);
+	}
+
+	for (const control of foregroundControls) {
+		if (control.parentWorkflowRunId && workflowParents.has(control.parentWorkflowRunId)) continue;
+		if (control.mode === "workflow") {
+			addCandidate({
+				internalKey: `foreground:${control.runId}`,
+				agent: "workflow",
+				startedAt: control.startedAt,
+				tokens: { input: control.inputTokens ?? 0, output: control.outputTokens ?? 0, total: control.tokens ?? 0 },
+				goal: control.description,
+				kind: "workflow",
+				workflow: buildWorkflowFleet(control.workflow, undefined, workflowChildren.get(control.runId)),
+			});
+			continue;
+		}
 		if (control.activeChildren?.size) {
 			for (const child of control.activeChildren.values()) addCandidate({
 				internalKey: `foreground:${control.runId}:${child.index}`,
@@ -190,8 +388,8 @@ function buildFleetStatus(
 			});
 		}
 	}
-	for (const job of state.asyncJobs.values()) {
-		if (job.sessionId !== authoritativeSessionId || !activeState(job.status)) continue;
+	for (const job of activeJobs) {
+		if (job.parentWorkflowRunId && workflowParents.has(job.parentWorkflowRunId)) continue;
 		const startedAt = job.startedAt ?? job.updatedAt;
 		if (job.mode === "workflow") {
 			const latestEmit = job.workflow?.emits?.length ? formatWorkflowJsonPreview(job.workflow.emits.at(-1), 120) : undefined;
@@ -201,6 +399,8 @@ function buildFleetStatus(
 				startedAt,
 				tokens: job.totalTokens,
 				goal: latestEmit !== undefined ? `latest emit: ${latestEmit}` : job.description,
+				kind: "workflow",
+				workflow: buildWorkflowFleet(job.workflow, job.steps, workflowChildren.get(job.asyncId)),
 			});
 			continue;
 		}
@@ -268,6 +468,9 @@ function buildFleetStatus(
 			startedAt,
 			tokens: publicTokens(candidate.tokens),
 			...(goal ? { goal } : {}),
+			...(candidate.kind === "workflow" && candidate.workflow
+				? { kind: "workflow" as const, workflow: candidate.workflow }
+				: {}),
 		});
 	}
 	for (const internalKey of keyState.keys.keys()) {
@@ -383,7 +586,7 @@ function pingData(ctx: ExtensionContext | null) {
 		methods: [...SUBAGENT_RPC_METHODS],
 		capabilities: {
 			status: true,
-			fleetStatus: { version: 1 },
+			fleetStatus: { version: 1, workflowGroups: { version: 1 } },
 			asyncSpawn: true,
 			steer: true,
 			nonRecoveringSteer: true,

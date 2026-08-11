@@ -40,17 +40,21 @@ Capability advertisements on `ping`:
 - `processTerminalProof` — the process-terminal proof status (see [observability.md](observability.md#process-terminal-proof)).
 - `nonRecoveringSteer` — RPC steering never pauses-and-revives.
 - `resume` — the revival seam described above.
-- `fleetStatus: { version: 1 }` — successful `status` replies additionally include `data.fleet`.
+- `fleetStatus: { version: 1, workflowGroups: { version: 1 } }` — successful `status` replies additionally include `data.fleet`; workflow grouping is an additive v1 field that older clients may ignore.
 
 Structured delegation progress updates carry `runId` as soon as foreground execution allocates it, so a caller can retain the package-owned revival target even if its own tool turn is interrupted before the terminal response. Foreground `details.results[]` rows also include a numeric `index` that is unique within the run and stable across partial progress snapshots and the final result; use `(runId, index)` instead of row position to correlate single, counted parallel, and chain children.
 
 ### Fleet status DTO
 
-When `ping.capabilities.fleetStatus` is `{ version: 1 }`, successful `status` replies include `data.fleet`: `{ version: 1, entries, totalActive, omitted }`.
+When `ping.capabilities.fleetStatus.version` is `1`, successful `status` replies include `data.fleet`: `{ version: 1, entries, totalActive, omitted }`.
 
-Entries are bounded, current-session public display records with an opaque reconciliation `key`, resolved `agent`, optional `role`, `model`, `effort`, caller-facing `goal`, safe `startedAt`, and `{ input, output, total }` tokens. `totalActive` and `omitted` preserve overflow information beyond the bounded entry window.
+Entries are bounded, current-session public display records with an opaque reconciliation `key`, resolved `agent`, optional `role`, `model`, `effort`, caller-facing `goal`, safe `startedAt`, and `{ input, output, total }` tokens. `totalActive` and `omitted` preserve overflow information beyond the bounded top-level group window.
 
-The DTO intentionally never exposes run, async, or tool IDs. Clients must ignore unknown fields and fall back to status text when the capability is absent.
+Peers advertising `workflowGroups: { version: 1 }` may add `kind: "workflow"` and a bounded `workflow` summary to an entry. That summary contains only display-safe caller-authored workflow keys, labels and phases, resolved child agent metadata, normalized child states, aggregate progress counts, and token usage. The parent entry's token fields aggregate settled child usage while the workflow remains active. Foreground and async child controls are reconciled into their workflow parent instead of being duplicated as top-level entries.
+
+Fleet replies expose at most 16 top-level entries and at most 16 workflow-step rows per entry. Workflow source traversal is bounded and its counters/projection are capped at 256 distinct steps; `total` and `omitted` preserve bounded overflow information rather than allowing persisted or malformed traces to create unbounded status work.
+
+The DTO intentionally never exposes run, async, or tool IDs. Workflow keys are caller-authored display identifiers, not execution targets. Clients must ignore unknown fields and fall back to status text when the capability is absent.
 
 ### Scope
 

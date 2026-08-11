@@ -97,7 +97,7 @@ describe("subagent extension RPC bridge", () => {
 		);
 		assert.deepEqual(
 			(reply as { data: { capabilities?: { fleetStatus?: unknown } } }).data.capabilities?.fleetStatus,
-			{ version: 1 },
+			{ version: 1, workflowGroups: { version: 1 } },
 		);
 
 		bridge.dispose();
@@ -234,6 +234,214 @@ describe("subagent extension RPC bridge", () => {
 			}],
 		});
 		assert.equal(JSON.stringify((reply as any).data.fleet).includes("private-run"), false);
+		bridge.dispose();
+	});
+
+	it("groups async workflow progress and live children without exposing internal ids", async () => {
+		const events = new FakeEvents();
+		const state = {
+			currentSessionId: "workflow-session",
+			foregroundControls: new Map([["private-child-control", {
+				runId: "private-child-control",
+				sessionId: "workflow-session",
+				mode: "single",
+				parentWorkflowRunId: "private-workflow-run",
+				workflowKey: "tests",
+				startedAt: 110,
+				updatedAt: 120,
+				currentAgent: "tester",
+				activeChildren: new Map([[0, {
+					index: 0,
+					agent: "tester",
+					description: "Run the focused integration suite",
+					startedAt: 115,
+					updatedAt: 120,
+					model: "openai/gpt-5.6-terra:high",
+					thinking: "high",
+					inputTokens: 12,
+					outputTokens: 34,
+					tokens: 46,
+				}]]),
+			}]]),
+			asyncJobs: new Map([["private-workflow-run", {
+				asyncId: "private-workflow-run",
+				asyncDir: "/private/workflow",
+				sessionId: "workflow-session",
+				status: "running",
+				mode: "workflow",
+				description: "Ship the workflow support",
+				startedAt: 100,
+				updatedAt: 130,
+				totalTokens: { input: 100, output: 20, total: 120 },
+				steps: [
+					{ agent: "scout", workflowKey: "scan", label: "scan", status: "completed", startedAt: 101 },
+					{ agent: "tests", workflowKey: "tests", label: "tests", status: "running", startedAt: 110 },
+					{ agent: "reviewer", workflowKey: "review", label: "UX review", phase: "Validation", status: "pending" },
+				],
+				workflow: {
+					trace: [
+						{ operation: "run", key: "scan", state: "completed", phase: "Discovery", label: "Repository scan" },
+						{ operation: "run", key: "tests", state: "started", phase: "Validation", label: "Focused tests" },
+					],
+					emits: [{ stage: "validation" }],
+					console: [],
+				},
+			}]]),
+		} as any;
+		const bridge = registerSubagentRpcBridge({
+			events,
+			getContext: () => ctx("workflow-session", "workflow-session"),
+			state,
+			execute: async () => ({ content: [], details: { mode: "management", results: [] } } as any),
+		});
+
+		const reply = await request(events, "workflow-fleet", "status");
+		const fleet = (reply as any).data.fleet;
+		assert.equal(fleet.totalActive, 1);
+		assert.equal(fleet.entries.length, 1);
+		assert.deepEqual(fleet.entries[0], {
+			key: "fleet-1",
+			agent: "workflow",
+			startedAt: 100,
+			tokens: { input: 100, output: 20, total: 120 },
+			goal: 'latest emit: {"stage":"validation"}',
+			kind: "workflow",
+			workflow: {
+				phase: "Validation",
+				total: 3,
+				completed: 1,
+				running: 1,
+				pending: 1,
+				failed: 0,
+				steps: [
+					{
+						key: "tests",
+						agent: "tester",
+						label: "Focused tests",
+						phase: "Validation",
+						state: "running",
+						model: "openai/gpt-5.6-terra:high",
+						effort: "high",
+						startedAt: 115,
+						tokens: { input: 12, output: 34, total: 46 },
+						goal: "Run the focused integration suite",
+					},
+					{
+						key: "review",
+						agent: "reviewer",
+						label: "UX review",
+						phase: "Validation",
+						state: "pending",
+						tokens: { input: 0, output: 0, total: 0 },
+					},
+					{
+						key: "scan",
+						agent: "scout",
+						label: "Repository scan",
+						phase: "Discovery",
+						state: "completed",
+						startedAt: 101,
+						tokens: { input: 0, output: 0, total: 0 },
+					},
+				],
+				omitted: 0,
+			},
+		});
+		assert.equal(JSON.stringify(fleet).includes("private-workflow-run"), false);
+		assert.equal(JSON.stringify(fleet).includes("private-child-control"), false);
+		bridge.dispose();
+	});
+
+	it("groups foreground workflow traces with their live child controls", async () => {
+		const events = new FakeEvents();
+		const parent = {
+			runId: "private-foreground-workflow",
+			sessionId: "workflow-session",
+			mode: "workflow",
+			startedAt: 200,
+			updatedAt: 230,
+			activeChildren: new Map(),
+			workflow: {
+				trace: [
+					{ operation: "run", key: "plan", state: "completed", phase: "Planning" },
+					{ operation: "run", key: "review", state: "started", phase: "Review", label: "Fresh review" },
+				],
+				emits: [],
+				console: [],
+			},
+		};
+		const child = {
+			runId: "private-foreground-child",
+			sessionId: "workflow-session",
+			mode: "single",
+			parentWorkflowRunId: "private-foreground-workflow",
+			workflowKey: "review",
+			startedAt: 220,
+			updatedAt: 230,
+			currentAgent: "reviewer",
+			activeChildren: new Map(),
+		};
+		const state = {
+			currentSessionId: "workflow-session",
+			foregroundControls: new Map<string, any>([[parent.runId, parent], [child.runId, child]]),
+			asyncJobs: new Map(),
+		} as any;
+		const bridge = registerSubagentRpcBridge({
+			events,
+			getContext: () => ctx("workflow-session", "workflow-session"),
+			state,
+			execute: async () => ({ content: [], details: { mode: "management", results: [] } } as any),
+		});
+
+		const reply = await request(events, "foreground-workflow-fleet", "status");
+		const fleet = (reply as any).data.fleet;
+		assert.equal(fleet.totalActive, 1);
+		assert.equal(fleet.entries[0]?.kind, "workflow");
+		assert.equal(fleet.entries[0]?.workflow.phase, "Review");
+		assert.equal(fleet.entries[0]?.workflow.running, 1);
+		assert.equal(fleet.entries[0]?.workflow.completed, 1);
+		assert.equal(fleet.entries[0]?.workflow.steps[0]?.label, "Fresh review");
+		assert.equal(JSON.stringify(fleet).includes("private-foreground-workflow"), false);
+		assert.equal(JSON.stringify(fleet).includes("private-foreground-child"), false);
+		bridge.dispose();
+	});
+
+	it("bounds oversized workflow sources and preserves duplicate fallback steps", async () => {
+		const events = new FakeEvents();
+		const steps = Array.from({ length: 300 }, (_, index) => ({
+			agent: "worker",
+			label: "duplicate",
+			status: index === 0 ? "running" : "pending",
+		}));
+		const state = {
+			currentSessionId: "workflow-session",
+			foregroundControls: new Map(),
+			asyncJobs: new Map([["private-workflow", {
+				asyncId: "private-workflow",
+				asyncDir: "/private/workflow",
+				sessionId: "workflow-session",
+				status: "running",
+				mode: "workflow",
+				startedAt: 100,
+				updatedAt: 100,
+				steps,
+				workflow: { trace: [], emits: [], console: [] },
+			}]]),
+		} as any;
+		const bridge = registerSubagentRpcBridge({
+			events,
+			getContext: () => ctx("workflow-session", "workflow-session"),
+			state,
+			execute: async () => ({ content: [], details: { mode: "management", results: [] } } as any),
+		});
+
+		const reply = await request(events, "bounded-workflow-fleet", "status");
+		const workflow = (reply as any).data.fleet.entries[0].workflow;
+		assert.equal(workflow.total, 256);
+		assert.equal(workflow.steps.length, 16);
+		assert.equal(workflow.omitted, 240);
+		assert.equal(new Set(workflow.steps.map((step: { key: string }) => step.key)).size, 16);
+		assert.equal(JSON.stringify(reply).includes("private-workflow"), false);
 		bridge.dispose();
 	});
 

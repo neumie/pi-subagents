@@ -1551,6 +1551,11 @@ export interface ForegroundRunControl {
 	currentIndex?: number;
 	/** Short caller-facing task/goal shown in fleet surfaces when available. */
 	description?: string;
+	/** Internal workflow ownership used only to group this control in public fleet projections. */
+	parentWorkflowRunId?: string;
+	workflowKey?: string;
+	/** Live workflow trace retained only on the owning foreground workflow control. */
+	workflow?: Details["workflow"];
 	currentActivityState?: ActivityState;
 	lastActivityAt?: number;
 	currentTool?: string;

@@ -4381,6 +4381,8 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 							delete job.agents;
 						}
 						job.workflow = status.workflow;
+						job.totalTokens = status.totalTokens;
+						job.totalCost = status.totalCost;
 					}
 				};
 				const projectWorkflowActivity = () => {
@@ -4504,6 +4506,10 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 									}, ctx, preserveActiveSession);
 								});
 								workflowResults.push(...result.details.results);
+								const aggregateUsage = sumResultsUsage(workflowResults);
+								status.totalTokens = { input: aggregateUsage.input, output: aggregateUsage.output, total: aggregateUsage.input + aggregateUsage.output };
+								status.totalCost = sumResultsCost(workflowResults);
+								persist();
 								if (result.details.asyncDir && missionBinding) writeMissionAsyncBinding(result.details.asyncDir, missionBinding);
 								const child = workflowChildResult(key, result);
 								const childStatus = missionWorkflowChildStatus(result);
@@ -4551,6 +4557,22 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 			const { workflowScript: _workflowScript, action: _action, agent: _agent, task: _task, resume: _resume, tasks: _tasks, chain: _chain, concurrency: _concurrency, async: _async, foregroundOnly: _foregroundOnly, clarify: _clarify, timeoutMs: _timeoutMs, maxRuntimeMs: _maxRuntimeMs, usageBudget: _usageBudget, chatProgress: _chatProgress, missionId: _missionId, mission: _mission, ...workflowChildDefaults } = requestParams;
 			const workflowResults: SingleResult[] = [];
 			let liveWorkflow: NonNullable<Details["workflow"]> = { trace: [], emits: [], console: [] };
+			const foregroundWorkflowControl = compactOptional<ForegroundRunControl>({
+				runId: _id,
+				sessionId: resolveCurrentSessionId(ctx.sessionManager),
+				mode: "workflow",
+				startedAt: Date.now(),
+				updatedAt: Date.now(),
+				cwd: workflowCwd,
+				description: derivedObjective,
+				parentWorkflowRunId: requestParams.workflowParentRunId,
+				workflowKey: requestParams.workflowKey,
+				workflow: liveWorkflow,
+				activeChildren: new Map(),
+				schedulingOwners: 1,
+			});
+			deps.state.foregroundControls.set(_id, foregroundWorkflowControl);
+			deps.state.lastForegroundControlId = _id;
 			const sendWorkflowProgress = () => {
 				const update = workflowChatProgressUpdate(_id, chatProgress, liveWorkflow);
 				if (update) onUpdate?.(update);
@@ -4563,10 +4585,14 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 					...(workflowState ? { state: workflowState } : {}),
 					onTrace: (trace) => {
 						liveWorkflow = { ...liveWorkflow, trace };
+						foregroundWorkflowControl.workflow = liveWorkflow;
+						foregroundWorkflowControl.updatedAt = Date.now();
 						sendWorkflowProgress();
 					},
 					onEmit: (emits) => {
 						liveWorkflow = { ...liveWorkflow, emits };
+						foregroundWorkflowControl.workflow = liveWorkflow;
+						foregroundWorkflowControl.updatedAt = Date.now();
 						sendWorkflowProgress();
 					},
 					launch: async (key, childParams, workflowSignal) => {
@@ -4606,6 +4632,11 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 							}, ctx, preserveActiveSession);
 						});
 						workflowResults.push(...result.details.results);
+						const aggregateUsage = sumResultsUsage(workflowResults);
+						foregroundWorkflowControl.inputTokens = aggregateUsage.input;
+						foregroundWorkflowControl.outputTokens = aggregateUsage.output;
+						foregroundWorkflowControl.tokens = aggregateUsage.input + aggregateUsage.output;
+						foregroundWorkflowControl.updatedAt = Date.now();
 						if (result.details.asyncDir && missionBinding) writeMissionAsyncBinding(result.details.asyncDir, missionBinding);
 						const child = workflowChildResult(key, result);
 						const childStatus = missionWorkflowChildStatus(result);
@@ -4644,6 +4675,9 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 					isError: true,
 					details: compactOptional<Details>({ mode: "workflow", runId: _id, results: partial.children.flatMap((child) => (child.results ?? []) as SingleResult[]), totalChildUsage: sumResultsUsage(workflowResults), totalCost: sumResultsCost(workflowResults), usageBudget: usageBudgetState(workflowUsageBudget.budget, sumResultsCost(workflowResults)), workflow: { trace: partial.trace, emits: partial.emits, console: partial.console }, chatProgress }),
 				});
+			} finally {
+				settleForegroundSchedulingOwner(foregroundWorkflowControl);
+				removeForegroundControlIfIdle(deps.state, _id);
 			}
 		}
 		const directParams = prepareWorkflowChildParams(requestParams);
@@ -5524,6 +5558,8 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 				currentAgent: undefined,
 				currentIndex: undefined,
 				description: foregroundDescription,
+				parentWorkflowRunId: effectiveParams.workflowParentRunId,
+				workflowKey: effectiveParams.workflowKey,
 				currentActivityState: undefined,
 				activeChildren: new Map(),
 				// The outer executor owns scheduling until its finally block settles.
@@ -5535,6 +5571,10 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 			deps.state.foregroundControls.set(runId, foregroundControl);
 			deps.state.lastForegroundControlId = runId;
 		}
+		const workflowParentControl = foregroundControl?.parentWorkflowRunId
+			? deps.state.foregroundControls.get(foregroundControl.parentWorkflowRunId)
+			: undefined;
+		if (workflowParentControl?.mode === "workflow") retainForegroundSchedulingOwner(workflowParentControl);
 
 		const writeNestedForegroundEvent = (type: "subagent.nested.started" | "subagent.nested.completed", result?: AgentToolResult<Details>): void => {
 			if (!inheritedNestedRoute || !nestedParentAddress) return;
@@ -5664,6 +5704,10 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 			if (foregroundControl) {
 				settleForegroundSchedulingOwner(foregroundControl);
 				removeForegroundControlIfIdle(deps.state, runId);
+			}
+			if (workflowParentControl?.mode === "workflow") {
+				settleForegroundSchedulingOwner(workflowParentControl);
+				removeForegroundControlIfIdle(deps.state, workflowParentControl.runId);
 			}
 		}
 
